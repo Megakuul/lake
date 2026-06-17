@@ -86,7 +86,22 @@ func NewFromClient(ctx context.Context, client *s3.Client, bucket string) (*Buck
 	return b, b.loadCatalog(ctx)
 }
 
+// checkNumeralBoundary checks if the originalMin - originalMax range is INSIDE the filter range.
+// Filters are optional, if one side is omitted everything on this side matches
+// e.g. max == nil means original range must be between min - ∞.
+func checkNumeralBoundary[T int64 | float64](originalMin, originalMax T, filterMin, filterMax *T) bool {
+	if filterMin != nil && *filterMin > originalMax {
+		return false
+	}
+	if filterMax != nil && *filterMax < originalMin {
+		return false
+	}
+	return true
+}
+
 func (b *Bucket) Lookup(ctx context.Context, tableName string, filter Boundaries) error {
+	b.catalogLock.RLock()
+	defer b.catalogLock.RUnlock()
 	shards := []Shard{}
 	table, ok := b.catalog.Tables[tableName]
 	if !ok {
@@ -95,38 +110,36 @@ func (b *Bucket) Lookup(ctx context.Context, tableName string, filter Boundaries
 	for _, shard := range table.Shards {
 		for name, field := range shard.Boundaries.Ints {
 			fieldFilter, ok := filter.Ints[name]
-			if !ok {
-				continue
-			}
-			if field.Min <= fieldFilter.Max && field.Max >= fieldFilter.Min {
-				shards = append(shards, shard)
-				break
+			if ok && field.Min != nil && field.Max != nil {
+				if !checkNumeralBoundary(*field.Min, *field.Max, fieldFilter.Min, fieldFilter.Max) {
+					break
+				}
 			}
 		}
 		for name, field := range shard.Boundaries.Doubles {
 			fieldFilter, ok := filter.Doubles[name]
-			if !ok {
-				continue
-			}
-			if field.Min <= fieldFilter.Max && field.Max >= fieldFilter.Min {
-				shards = append(shards, shard)
-				break
+			if ok && field.Min != nil && field.Max != nil {
+				if !checkNumeralBoundary(*field.Min, *field.Max, fieldFilter.Min, fieldFilter.Max) {
+					break
+				}
 			}
 		}
+		shards = append(shards, shard)
 	}
 
 	for _, shard := range shards {
-		println("opending the reader")
 		reader := newReader(ctx, b.client, b.name, shard.Target)
 		file, err := parquet.OpenFile(reader, int64(shard.Size))
 		if err != nil {
 			return fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
 		}
 
+		println("column idx")
+		println(len(file.ColumnIndexes()))
+		println("offset idx")
+		println(len(file.OffsetIndexes()))
 		for _, offset := range file.OffsetIndexes() {
-			println(len(offset.PageLocations))
 			for _, location := range offset.PageLocations {
-				println("im in a page location")
 				_ = location
 			}
 		}

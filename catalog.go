@@ -21,12 +21,19 @@ type Boundaries struct {
 	Doubles map[string]DoubleBoundary `json:"doubles"`
 }
 
+func newBoundaries() Boundaries {
+	return Boundaries{
+		Ints:    map[string]IntBoundary{},
+		Doubles: map[string]DoubleBoundary{},
+	}
+}
+
 type IntBoundary struct {
-	Max int64 `json:"max"`
-	Min int64 `json:"min"`
+	Max *int64 `json:"max"`
+	Min *int64 `json:"min"`
 }
 
 type DoubleBoundary struct {
-	Max float64 `json:"max"`
-	Min float64 `json:"min"`
+	Max *float64 `json:"max"`
+	Min *float64 `json:"min"`
 }

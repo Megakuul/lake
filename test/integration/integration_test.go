@@ -18,9 +18,9 @@ import (
 )
 
 type Request struct {
-	Timestamp int64         `parquet:"timestamp"`
-	Latency   time.Duration `parquet:"latency"`
-	Endpoint  string        `parquet:"endpoint"`
+	Timestamp lakedb.Int `parquet:"timestamp"`
+	Latency   lakedb.Int `parquet:"latency"`
+	Endpoint  string     `parquet:"endpoint"`
 }
 
 func TestOperations(t *testing.T) {
@@ -57,15 +57,35 @@ func TestOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = lakedb.Insert(t.Context(), bucket, Request{
-		Timestamp: time.Now().Unix(),
-		Latency:   time.Hour,
+	ingestor := lakedb.NewIngestor[Request](bucket)
+	err = ingestor.Insert(t.Context(), Request{
+		Timestamp: lakedb.IntValue(time.Now().Unix()),
+		Latency:   lakedb.IntValue(int64(time.Hour)),
 		Endpoint:  "Some Endpoint",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = lakedb.Query(t.Context(), bucket, nil)
+	err = ingestor.Insert(t.Context(), Request{
+		Timestamp: lakedb.IntValue(time.Now().Unix()),
+		Latency:   lakedb.IntValue(int64(120 * time.Second)),
+		Endpoint:  "Some Endpoint",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ingestor.Insert(t.Context(), Request{
+		Timestamp: lakedb.IntValue(time.Now().Unix()),
+		Latency:   lakedb.IntValue(int64(time.Minute)),
+		Endpoint:  "Another Enedpoint",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ingestor.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	err = lakedb.Query(t.Context(), bucket, Request{})
 	if err != nil {
 		t.Fatal(err)
 	}

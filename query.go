@@ -2,28 +2,21 @@ package lakedb
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
-	"time"
 )
 
 func Query(ctx context.Context, bucket *Bucket, filter any) error {
-	err := bucket.Lookup(ctx, "test", Boundaries{
-		Ints: map[string]IntBoundary{
-			"timestamp": {Max: time.Now().Add(time.Hour).Unix(), Min: time.Now().Add(-time.Hour).Unix()},
-		},
-	})
-	if err != nil {
-		return err
+	boundaries := newBoundaries()
+	filterValue := reflect.ValueOf(filter)
+	if !filterValue.IsValid() {
+		return fmt.Errorf("invalid input filter type (expected table struct)")
 	}
-	return nil
-	floatFields := map[string]Double{}
-	filterVal := reflect.ValueOf(filter)
-	for fieldMeta := range filterVal.Fields() {
+	for fieldMeta := range filterValue.Fields() {
 		if !fieldMeta.IsExported() {
 			continue
 		}
-
 		fieldName := ""
 		tag := strings.SplitN(fieldMeta.Tag.Get("parquet"), ",", 1)
 		if len(tag) < 1 || tag[0] == "" {
@@ -31,11 +24,17 @@ func Query(ctx context.Context, bucket *Bucket, filter any) error {
 		} else {
 			fieldName = tag[0]
 		}
-		switch fieldFilter := filterVal.FieldByIndex(fieldMeta.Index).Interface().(type) {
+		switch field := filterValue.FieldByIndex(fieldMeta.Index).Interface().(type) {
+		case Int:
+			boundaries.Ints[fieldName] = IntBoundary{Max: field.filterMax, Min: field.filterMin}
 		case Double:
-			floatFields[fieldName] = fieldFilter
+			boundaries.Doubles[fieldName] = DoubleBoundary{Max: field.filterMax, Min: field.filterMin}
 		}
 	}
 
+	err := bucket.Lookup(ctx, getTableName(filterValue), boundaries)
+	if err != nil {
+		return err
+	}
 	return nil
 }
