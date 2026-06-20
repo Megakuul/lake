@@ -39,37 +39,29 @@ func (i *Ingestor[T]) Insert(ctx context.Context, row T) error {
 			continue
 		}
 		fieldName := ""
-		tag := strings.SplitN(fieldMeta.Tag.Get("parquet"), ",", 1)
-		if len(tag) < 1 || tag[0] == "" {
+		tag := strings.SplitN(fieldMeta.Tag.Get("parquet"), ",", 2)
+		if len(tag) < 2 || tag[0] == "" {
 			fieldName = fieldMeta.Name
 		} else {
 			fieldName = tag[0]
 		}
 		switch field := rowValue.FieldByIndex(fieldMeta.Index).Interface().(type) {
 		case Int:
-			boundary, ok := i.boundaries.Ints[fieldName]
-			if !ok {
-				boundary = IntBoundary{Max: new(int64), Min: new(int64)}
-				i.boundaries.Ints[fieldName] = boundary
+			boundary := i.boundaries.Ints[fieldName]
+			if boundary.Max == nil || *boundary.Max < field.Data {
+				boundary.Max = &field.Data
 			}
-			if *boundary.Max < field.data { // here is nil deref
-				*boundary.Max = field.data
-			}
-			if *boundary.Min > field.data {
-				*boundary.Min = field.data
+			if boundary.Min == nil || *boundary.Min > field.Data {
+				boundary.Min = &field.Data
 			}
 			i.boundaries.Ints[fieldName] = boundary
 		case Double:
-			boundary, ok := i.boundaries.Doubles[fieldName]
-			if !ok {
-				boundary = DoubleBoundary{Max: new(float64), Min: new(float64)}
-				i.boundaries.Doubles[fieldName] = boundary
+			boundary := i.boundaries.Doubles[fieldName]
+			if boundary.Max == nil || *boundary.Max < field.Data {
+				boundary.Max = &field.Data
 			}
-			if *boundary.Max < field.data {
-				*boundary.Max = field.data
-			}
-			if *boundary.Min > field.data {
-				*boundary.Min = field.data
+			if boundary.Min == nil || *boundary.Min > field.Data {
+				boundary.Min = &field.Data
 			}
 			i.boundaries.Doubles[fieldName] = boundary
 		default:

@@ -3,10 +3,12 @@ package lakedb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"path"
 	"sync"
@@ -134,14 +136,86 @@ func (b *Bucket) Lookup(ctx context.Context, tableName string, filter Boundaries
 			return fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
 		}
 
-		println("column idx")
-		println(len(file.ColumnIndexes()))
-		println("offset idx")
-		println(len(file.OffsetIndexes()))
-		for _, offset := range file.OffsetIndexes() {
-			for _, location := range offset.PageLocations {
-				_ = location
+		if len(file.OffsetIndexes()) != len(file.ColumnIndexes()) {
+			return fmt.Errorf("corrupted column or offset index")
+		}
+
+		for rgIdx, rg := range file.RowGroups() {
+			for columnIdx, column := range file.Root().Columns() {
+				// columnIndexes are stored in this weird rg1.col1,rg1.col2,rg2.col1,rg2.col2 format
+				// the following code simply unwraps this. To avoid panics on corrupted data we also check boundary.
+				columnIndexIdx := (rgIdx * len(file.Root().Columns())) + columnIdx
+				if len(file.ColumnIndexes()) <= columnIndexIdx {
+					return fmt.Errorf("corrupted column index")
+				}
+				columnIndex := file.ColumnIndexes()[columnIndexIdx]
+				offsetIndex := file.OffsetIndexes()[columnIndexIdx]
+
+				if len(rg.ColumnChunks()) <= columnIdx {
+					return fmt.Errorf("corrupted column chunk in row group")
+				}
+				pages := rg.ColumnChunks()[columnIdx].Pages()
+				defer pages.Close()
+
+				check := func(min, max []byte) bool { return true }
+				switch column.Type() {
+				case parquet.Int64Type:
+					boundary := shard.Boundaries.Ints[column.Name()]
+					check = func(rawMin, rawMax []byte) bool {
+						min := int64(binary.LittleEndian.Uint64(rawMin))
+						max := int64(binary.LittleEndian.Uint64(rawMax))
+						return checkNumeralBoundary(min, max, boundary.Min, boundary.Max)
+					}
+				case parquet.DoubleType:
+					boundary := shard.Boundaries.Doubles[column.Name()]
+					check = func(rawMin, rawMax []byte) bool {
+						min := math.Float64frombits(binary.LittleEndian.Uint64(rawMin))
+						max := math.Float64frombits(binary.LittleEndian.Uint64(rawMax))
+						return checkNumeralBoundary(min, max, boundary.Min, boundary.Max)
+					}
+				}
+				for pageIdx, rawMin := range columnIndex.MinValues {
+					if len(columnIndex.MaxValues) <= pageIdx {
+						return fmt.Errorf("corrupted column index boundary statistic")
+					}
+					if !check(rawMin, columnIndex.MaxValues[pageIdx]) {
+						continue
+					}
+					if len(offsetIndex.PageLocations) <= pageIdx {
+						return fmt.Errorf("corrupted offset index")
+					}
+					pageLocation := offsetIndex.PageLocations[pageIdx]
+
+					err = pages.SeekToRow(pageLocation.FirstRowIndex)
+					if err != nil {
+						return fmt.Errorf("failed to seek to page row: %v", err)
+					}
+					page, err := pages.ReadPage()
+					if err != nil {
+						return fmt.Errorf("failed to read page: %v", err)
+					}
+					values := []parquet.Value{}
+					_, err = page.Values().ReadValues(values)
+					if err != nil {
+						return fmt.Errorf("failed to read rows: %v", err)
+					}
+				}
 			}
+		}
+
+		for pageIdx, pageMeta := range file.ColumnIndexes() {
+			pageOffset := file.OffsetIndexes()[pageIdx]
+			println("page locs")
+			println(len(pageOffset.PageLocations))
+
+			println("min vals")
+			println(len(pageMeta.MaxValues))
+			_ = pageIdx
+			// for i, min := range pageMeta.MinValues {
+			// 	max := pageMeta.MaxValues[i]
+			//
+			// 	filter.Ints
+			// }
 		}
 	}
 	return fmt.Errorf("alarm")

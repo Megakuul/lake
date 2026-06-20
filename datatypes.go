@@ -5,14 +5,14 @@ func Filter[T DoubleFilter | IntFilter]() *T {
 }
 
 type Double struct {
-	data      float64              `parquet:"data"`
+	Data      float64              `parquet:"data"`
 	filterMax *float64             `parquet:"-"`
 	filterMin *float64             `parquet:"-"`
 	filterOps []func(float64) bool `parquet:"-"`
 }
 
 func DoubleValue(value float64) Double {
-	return Double{data: value}
+	return Double{Data: value}
 }
 
 type DoubleFilter Double
@@ -37,14 +37,14 @@ func (f *Double) Check(operand float64) bool {
 }
 
 type Int struct {
-	data      int64              `parquet:"data"`
+	Data      int64              `parquet:"data"`
 	filterMax *int64             `parquet:"-"`
 	filterMin *int64             `parquet:"-"`
 	filterOps []func(int64) bool `parquet:"-"`
 }
 
 func IntValue(value int64) Int {
-	return Int{data: value}
+	return Int{Data: value}
 }
 
 type IntFilter Int
