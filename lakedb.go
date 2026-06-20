@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"path"
+	"slices"
 	"sync"
 	"time"
 
@@ -103,33 +104,34 @@ func checkNumeralBoundary[T int64 | float64](originalMin, originalMax T, filterM
 	return true
 }
 
-func (b *Bucket) Lookup(ctx context.Context, tableName string, bounds Boundaries, filters map[string]checkFilter, extract func(io.ReaderAt, int64) bool) error {
+func lookup[T any](ctx context.Context, b *Bucket, tableName string, bounds Boundaries, filters map[string]checkFilter) ([]T, error) {
 	b.catalogLock.RLock()
 	defer b.catalogLock.RUnlock()
 	table, ok := b.catalog.Tables[tableName]
 	if !ok {
-		return fmt.Errorf("table '%s' does not exist", tableName)
+		return nil, fmt.Errorf("table '%s' does not exist", tableName)
 	}
 
+	outputRows := []T{}
 	for _, shard := range filterShards(table.Shards, bounds) {
 		result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: &b.name,
 			Key:    &shard.Target,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer result.Body.Close()
 		buffer, err := io.ReadAll(result.Body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		file, err := parquet.OpenFile(bytes.NewReader(buffer), int64(shard.Size))
 		if err != nil {
-			return fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
+			return nil, fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
 		}
 		if len(file.OffsetIndexes()) != len(file.ColumnIndexes()) {
-			return fmt.Errorf("corrupted column or offset index")
+			return nil, fmt.Errorf("corrupted column or offset index")
 		}
 
 		rows := map[int64]struct{}{}
@@ -139,13 +141,13 @@ func (b *Bucket) Lookup(ctx context.Context, tableName string, bounds Boundaries
 				// the following code simply unwraps this. To avoid panics on corrupted data we also check boundary.
 				columnIndexIdx := (rgIdx * len(file.Root().Columns())) + columnIdx
 				if len(file.ColumnIndexes()) <= columnIndexIdx {
-					return fmt.Errorf("corrupted column index")
+					return nil, fmt.Errorf("corrupted column index")
 				}
 				columnIndex := file.ColumnIndexes()[columnIndexIdx]
 				offsetIndex := file.OffsetIndexes()[columnIndexIdx]
 
 				if len(rg.ColumnChunks()) <= columnIdx {
-					return fmt.Errorf("corrupted column chunk in row group")
+					return nil, fmt.Errorf("corrupted column chunk in row group")
 				}
 				chunk := rg.ColumnChunks()[columnIdx]
 
@@ -173,7 +175,7 @@ func (b *Bucket) Lookup(ctx context.Context, tableName string, bounds Boundaries
 
 				matches, err := scanRows(chunk, columnIndex, offsetIndex, checkBoundary, checkFilter)
 				if err != nil {
-					return fmt.Errorf("failed scan rows: %v", err)
+					return nil, fmt.Errorf("failed scan rows: %v", err)
 				}
 				if columnIdx == 0 {
 					maps.Copy(rows, matches)
@@ -189,13 +191,20 @@ func (b *Bucket) Lookup(ctx context.Context, tableName string, bounds Boundaries
 			}
 		}
 
-		for row := range maps.Keys(rows) {
-			if !extract(file, row) {
-				break
+		reader := parquet.NewGenericReader[T](file)
+		defer reader.Close()
+
+		rowsBuffer := make([]T, 1)
+		for _, row := range slices.Sorted(maps.Keys(rows)) {
+			reader.SeekToRow(row)
+			n, err := reader.Read(rowsBuffer)
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("failed to read rows: %v", err)
 			}
+			outputRows = append(outputRows, rowsBuffer[:n]...)
 		}
 	}
-	return nil
+	return outputRows, nil
 }
 
 type (
@@ -230,12 +239,12 @@ func scanRows(chunk parquet.ColumnChunk, column format.ColumnIndex, offset forma
 		if err != nil {
 			return nil, fmt.Errorf("failed to read page: %v", err)
 		}
-		values := []parquet.Value{}
-		_, err = page.Values().ReadValues(values)
-		if err != nil {
+		values := make([]parquet.Value, page.NumValues())
+		n, err := page.Values().ReadValues(values)
+		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read rows: %v", err)
 		}
-		for valueIdx, value := range values {
+		for valueIdx, value := range values[:n] {
 			if checkFilter(value) {
 				approved[pageLocation.FirstRowIndex+int64(valueIdx)] = struct{}{}
 			}
@@ -264,7 +273,7 @@ func filterShards(shards []Shard, bounds Boundaries) []Shard {
 				}
 			}
 		}
-		filteredShards = append(shards, shard)
+		filteredShards = append(filteredShards, shard)
 	}
 	return filteredShards
 }

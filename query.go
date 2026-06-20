@@ -3,7 +3,6 @@ package lakedb
 import (
 	"context"
 	"fmt"
-	"io"
 	"reflect"
 	"strings"
 
@@ -12,6 +11,7 @@ import (
 
 func Query[T any](ctx context.Context, bucket *Bucket, filter T) ([]T, error) {
 	boundaries := newBoundaries()
+	filters := map[string]checkFilter{}
 	filterValue := reflect.ValueOf(filter)
 	if !filterValue.IsValid() {
 		return nil, fmt.Errorf("invalid input filter type (expected table struct)")
@@ -29,24 +29,47 @@ func Query[T any](ctx context.Context, bucket *Bucket, filter T) ([]T, error) {
 		}
 		switch field := filterValue.FieldByIndex(fieldMeta.Index).Interface().(type) {
 		case Int:
-			boundaries.Ints[fieldName] = IntBoundary{Max: field.filterMax, Min: field.filterMin}
+			boundaries.Ints[fieldName] = IntBoundary{Max: field.filter.max, Min: field.filter.min}
+			filters[fieldName] = func(v parquet.Value) bool {
+				if v.Kind() != parquet.Int64 {
+					return true
+				}
+				for _, op := range field.filter.filterOps {
+					if !op(v.Int64()) {
+						return false
+					}
+				}
+				return true
+			}
 		case Double:
-			boundaries.Doubles[fieldName] = DoubleBoundary{Max: field.filterMax, Min: field.filterMin}
+			boundaries.Doubles[fieldName] = DoubleBoundary{Max: field.filter.max, Min: field.filter.min}
+			filters[fieldName] = func(v parquet.Value) bool {
+				if v.Kind() != parquet.Double {
+					return true
+				}
+				for _, op := range field.filter.filterOps {
+					if !op(v.Double()) {
+						return false
+					}
+				}
+				return true
+			}
+		case String:
+			filters[fieldName] = func(v parquet.Value) bool {
+				if v.Kind() != parquet.ByteArray {
+					return true
+				}
+				for _, op := range field.filter.filterOps {
+					if !op(string(v.ByteArray())) {
+						return false
+					}
+				}
+				return true
+			}
 		}
 	}
 
-	rows := []T{}
-	err := bucket.Lookup(ctx, getTableName(filterValue), boundaries, map[string]checkFilter{}, func(file io.ReaderAt, rowIdx int64) bool {
-		reader := parquet.NewGenericReader[T](file)
-		defer reader.Close()
-		rowsBuffer := make([]T, 1)
-		_, err := reader.Read(rowsBuffer)
-		if err != nil {
-			println(err.Error())
-		}
-		rows = append(rows, rowsBuffer...)
-		return true
-	})
+	rows, err := lookup[T](ctx, bucket, getTableName(filterValue), boundaries, filters)
 	if err != nil {
 		return nil, err
 	}

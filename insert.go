@@ -64,7 +64,6 @@ func (i *Ingestor[T]) Insert(ctx context.Context, row T) error {
 				boundary.Min = &field.Data
 			}
 			i.boundaries.Doubles[fieldName] = boundary
-		default:
 		}
 	}
 	_, err := i.writer.Write([]T{row})
