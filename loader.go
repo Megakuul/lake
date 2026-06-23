@@ -54,7 +54,7 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, ranges map[
 		if check, ok := checks[name]; ok {
 			chunkCheck = check
 		}
-		matches, err := scanRows(chunk, ranges[name], chunkCheck)
+		matches, err := scanChunk(chunk, ranges[name], chunkCheck)
 		if err != nil {
 			return nil, fmt.Errorf("failed scan rows: %v", err)
 		}
@@ -89,9 +89,9 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, ranges map[
 	return rows, nil
 }
 
-// scanRows checks the boundary for each page and applies the filter to each rows in matching pages.
+// scanChunk checks the boundary for each page and applies the filter to each rows in matching pages.
 // Returns a map containing the global row index for each matching row.
-func scanRows(chunk parquet.ColumnChunk, filterRange catalog.Range, check func(parquet.Value) bool) (map[int64]struct{}, error) {
+func scanChunk(chunk parquet.ColumnChunk, filterRange catalog.Range, check func(parquet.Value) bool) (map[int64]struct{}, error) {
 	pages := chunk.Pages()
 	defer pages.Close()
 

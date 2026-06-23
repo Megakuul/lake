@@ -72,6 +72,7 @@ func (i *Ingestor[T]) Insert(ctx context.Context, row T) error {
 			i.ranges[fieldName] = filterRange
 		}
 	}
+
 	_, err := i.buffer.Write([]T{row})
 	return err
 }
@@ -85,6 +86,7 @@ func (i *Ingestor[T]) Close(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to flush parquet buffer: %v", err)
 	}
+
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("failed to flush parquet writer: %v", err)
 	}

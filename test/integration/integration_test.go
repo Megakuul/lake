@@ -69,9 +69,9 @@ func TestOperations(t *testing.T) {
 
 	start := time.Now()
 	ingestor := lakedb.NewIngestor(bucket, Request{})
-	for i := range int64(1) {
+	for i := range int64(1000000) {
 		err = ingestor.Insert(t.Context(), Request{
-			Timestamp: lakedb.NewInt(time.Now().Unix()),
+			Timestamp: lakedb.NewInt(69),
 			Latency:   lakedb.NewInt(i),
 			Endpoint:  lakedb.NewString("Another Enedpoint"),
 		})
@@ -82,9 +82,10 @@ func TestOperations(t *testing.T) {
 	if err = ingestor.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	for i := range int64(1) {
+	ingestor = lakedb.NewIngestor(bucket, Request{})
+	for i := range int64(1000000) {
 		err = ingestor.Insert(t.Context(), Request{
-			Timestamp: lakedb.NewInt(time.Now().Unix()),
+			Timestamp: lakedb.NewInt(187),
 			Latency:   lakedb.NewInt(i + 500000),
 			Endpoint:  lakedb.NewString("Another Enedpoint"),
 		})
