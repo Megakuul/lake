@@ -18,10 +18,11 @@ type QueryBuilder[T Table] struct {
 
 func Query[T Table]() *QueryBuilder[T] {
 	return &QueryBuilder[T]{query: query{
-		ranges:     map[string]catalog.Range{},
-		checks:     map[string]func(parquet.Value) bool{},
-		grouping:   map[string][]func(parquet.Value) bool{},
-		aggregator: map[string][]func([]parquet.Value) parquet.Value{},
+		ranges:      map[string]catalog.Range{},
+		checks:      map[string]func(parquet.Value) bool{},
+		limit:       -1,
+		grouping:    []map[string]func(parquet.Value) bool{},
+		aggregators: []map[string]func([]parquet.Value) parquet.Value{},
 	}}
 }
 
@@ -54,27 +55,35 @@ func (b *QueryBuilder[T]) Where(filter T) *QueryBuilder[T] {
 	return b
 }
 
-func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket, v []T) error {
+func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error) {
+	// use one empty group (match everything into the group) for the scan.
+	b.grouping = []map[string]func(parquet.Value) bool{{}}
+
 	pseudo := *new(T)
 	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
-	rows, err := bucket.lookup(ctx, schema, b.ranges, b.checks)
+	groups, err := bucket.lookup(ctx, schema, &b.query)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, row := range rows {
+	result := make([]T, 0, len(groups[0]))
+	for _, row := range groups[0] {
 		var outputRow T
 		if err = schema.Reconstruct(&outputRow, row); err != nil {
-			return fmt.Errorf("failed to deserialize row: %v", err)
+			return nil, fmt.Errorf("failed to deserialize row: %v", err)
 		}
-		v = append(v, outputRow)
+		result = append(result, outputRow)
 	}
-	return nil
+	return result, nil
 }
 
-func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows []any) error {
-	groupings := map[string][]func(parquet.Value) bool{}
-	aggregators := map[string][]func([]parquet.Value) parquet.Value{}
+func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows []T) error {
+	b.grouping = []map[string]func(parquet.Value) bool{}
+	b.aggregators = []map[string]func([]parquet.Value) parquet.Value{}
+
 	for i, window := range windows {
+		b.grouping = append(b.grouping, map[string]func(parquet.Value) bool{})
+		b.aggregators = append(b.aggregators, map[string]func([]parquet.Value) parquet.Value{})
+
 		windowValue := reflect.ValueOf(window)
 		if !windowValue.IsValid() {
 			panic("invalid aggregator window type (expected struct)")
@@ -84,34 +93,23 @@ func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows
 				continue
 			}
 			columnName := getColumnName(columnMeta)
-
-			// by default an aggregation window groups EVERYTHING (global aggregation)
-			// window columns can optionally specify a generic filter to block out rows from this window.
-			groupFilter := func(parquet.Value) bool { return true }
 			if filter, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(genericFilter); ok {
-				groupFilter = filter.filter
+				b.grouping[i][columnName] = filter.filter
 			}
-			groupings[columnName] = append(groupings[columnName], groupFilter)
-
-			// aggregators per window and per column are required so that the engine understands how to calculate the result.
 			if aggregator, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(genericAggregator); ok {
-				aggregators[columnName] = append(aggregators[columnName], aggregator.aggregate)
-			} else {
-				panic(fmt.Sprintf(
-					"aggregation window '%d' does not specify an aggregation operation for column '%s' this is not allowed!", i, columnName,
-				))
+				b.aggregators[i][columnName] = aggregator.aggregate
 			}
 		}
 	}
 
 	pseudo := *new(T)
 	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
-	rows, err := bucket.lookup(ctx, schema, b.ranges, b.checks)
+	groups, err := bucket.lookup(ctx, schema, &b.query)
 	if err != nil {
 		return err
 	}
-	for i, row := range rows {
-		if err = schema.Reconstruct(&windows[i], row); err != nil {
+	for i, group := range groups {
+		if err = schema.Reconstruct(&windows[i], group[0]); err != nil {
 			return fmt.Errorf("failed to deserialize row: %v", err)
 		}
 	}

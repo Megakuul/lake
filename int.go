@@ -48,6 +48,9 @@ func (d intOperation) filter(v parquet.Value) bool {
 }
 
 func (d intOperation) aggregate(rows []parquet.Value) parquet.Value {
+	if d.aggregator == nil {
+		return parquet.NullValue() // if aggregation function is unset we just set default value
+	}
 	return parquet.Int64Value(d.aggregator(func(yield func(int64) bool) {
 		for _, row := range rows {
 			if !yield(row.Int64()) {
@@ -57,8 +60,8 @@ func (d intOperation) aggregate(rows []parquet.Value) parquet.Value {
 	}, len(rows)))
 }
 
-func NewIntOperation() *intOperation {
-	return new(intOperation)
+func NewIntOp() *intOperation {
+	return &intOperation{}
 }
 
 // filters

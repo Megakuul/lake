@@ -85,7 +85,7 @@ func NewFromClient(ctx context.Context, client *s3.Client, bucket string) (*Buck
 	return b, b.loadCatalog(ctx)
 }
 
-func (b *Bucket) write(ctx context.Context, tableName string, data []byte, partitions map[string]catalog.Partition, ranges map[string]catalog.Range) error {
+func (b *Bucket) write(ctx context.Context, tableName string, data []byte, ranges map[string]catalog.Range) error {
 	target := path.Join(tableName, uuid.New().String()+".parquet")
 	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      &b.name,
@@ -98,10 +98,9 @@ func (b *Bucket) write(ctx context.Context, tableName string, data []byte, parti
 	}
 
 	shard := catalog.Shard{
-		Size:       len(data),
-		Target:     target,
-		Partitions: partitions,
-		Ranges:     ranges,
+		Size:   len(data),
+		Target: target,
+		Ranges: ranges,
 	}
 	modification := func(c *catalog.Catalog) error {
 		table := c.Tables[tableName]

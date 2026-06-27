@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/megakuul/lakedb/catalog"
@@ -17,17 +18,17 @@ import (
 // 2. check filters (perform exact fine grained filtering on values that passed the range filter).
 // 3. limit applies to stop the filtering process.
 // 4. grouping (uses fine grained filters to group rows into one or more "windows" (by default just one global window))
-// 5. aggregator (takes the grouped "windows" and applies aggregation to each column to collapse the grouped rows)
+// 5. aggregators (takes the grouped "windows" and applies aggregation to each column to collapse the grouped rows)
 type query struct {
-	ranges     map[string]catalog.Range
-	checks     map[string]func(parquet.Value) bool
-	limit      int
-	grouping   []map[string]func(parquet.Value) bool            // grouping must contain at least one entry (otherwise nothing is returned).
-	aggregator []map[string]func([]parquet.Value) parquet.Value // aggregator is expected to match to the number of groups.
+	ranges      map[string]catalog.Range
+	checks      map[string]func(parquet.Value) bool
+	limit       int                                              // if set to -1 there is no limit
+	grouping    []map[string]func(parquet.Value) bool            // grouping must contain at least one entry (otherwise nothing is returned).
+	aggregators []map[string]func([]parquet.Value) parquet.Value // aggregators is expected to match to the number of groups.
 }
 
 // lookup uses the provided ranges and checks to efficiently find all matching rows.
-func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) ([]parquet.Row, error) {
+func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) ([][]parquet.Row, error) {
 	b.catalogLock.RLock()
 	defer b.catalogLock.RUnlock()
 	table, ok := b.catalog.Tables[schema.Name()]
@@ -60,67 +61,114 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 		return nil, fmt.Errorf("failed to merge row groups: %v", err)
 	}
 
-	// groups represent the output mapping of group idx -> row idx -> matched in the filter.
-	groups := make([][]bool, len(q.grouping))
-	for group := range groups {
-		// TODO this could be a bitset instead to reduce size from chunk.NumValues() * 1 byte -> chunk.NumValues() * 1 bit
-		// but linus, why is this not a map anymore?
-		// -> It's a tragedy I know, even the cpu cache misses the map ^^
-		groups[group] = make([]bool, rowGroup.NumRows())
-	}
+	// TODO this could be a bitset instead to reduce size from chunk.NumValues() * 1 byte -> chunk.NumValues() * 1 bit
+	// but linus, why is this not a map anymore?
+	// -> It's a tragedy I know, even the cpu cache misses the map ^^
+	rows := make([]bool, rowGroup.NumRows())
 
 	for _, chunk := range rowGroup.ColumnChunks() {
-		columnName := rowGroup.Schema().Columns()[chunk.Column()][0]
+		name := rowGroup.Schema().Columns()[chunk.Column()][0]
 		chunkCheck := func(parquet.Value) bool { return true }
-		if check, ok := q.checks[columnName]; ok {
+		if check, ok := q.checks[name]; ok {
 			chunkCheck = check
 		}
 		matches := make([]bool, rowGroup.NumRows())
-		if err := scanChunk(chunk, matches, q.ranges[columnName], chunkCheck); err != nil {
+		if err := scanChunk(chunk, matches, q.ranges[name], chunkCheck); err != nil {
 			return nil, fmt.Errorf("failed scan chunk: %v", err)
 		}
-		for group, groupFilters := range q.grouping {
-			if filter, ok := groupFilters[columnName]; ok {
-				filter()
-			}
-			// take the set from the first column as base.
-			if chunk.Column() == 0 {
-				groups[group] = matches
+		// take the set from the first column as base.
+		if chunk.Column() == 0 {
+			rows = matches
+			continue
+		}
+		// subsequent matches will just remove non-matching values from base (column filters are always AND joined).
+		for row, ok := range rows {
+			if ok && matches[row] {
 				continue
 			}
-			// subsequent matches will just remove non-matching values from base (column filters are always AND joined).
-			for row, ok := range groups[group] {
-				if ok && matches[row] {
-					continue
-				}
-				groups[group][row] = false
-			}
+			rows[row] = false
 		}
 	}
 
 	reader := rowGroup.Rows()
 	defer reader.Close()
 
-	parquetRows := make([]parquet.Row, 0)
-	for row, ok := range rows {
-		if !ok {
+	count := 0
+	println("starting measure")
+	start := time.Now()
+	// groups create a mapping from groups and parquet rows. Global aggregations or scans should only use one group.
+	groups := make([][]parquet.Row, len(q.grouping))
+	for i := 0; i < len(rows); i++ {
+		if !rows[i] {
 			continue
 		}
-		// TODO could be done earlier to avoid filter overhead, but requires more sophisticated engine.
-		if len(parquetRows) >= q.limit {
+		count++
+		if q.limit != -1 && count > q.limit {
 			break
 		}
-		if err = reader.SeekToRow(int64(row)); err != nil {
+		if err = reader.SeekToRow(int64(i)); err != nil {
 			return nil, fmt.Errorf("failed to seek row: %v", err)
 		}
-		out := make([]parquet.Row, 1)
-		_, err := reader.ReadRows(out)
+		batch := 1
+		for {
+			if len(rows) <= i+1 || !rows[i+1] {
+				break
+			}
+			batch++
+			i++
+		}
+		rowBuffer := make([]parquet.Row, batch)
+		_, err := reader.ReadRows(rowBuffer)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read rows: %v", err)
 		}
-		parquetRows = append(parquetRows, out[0].Clone())
+		for _, row := range rowBuffer {
+			for group, groupFilters := range q.grouping {
+				parquetRow, skip := row, false
+				parquetRow.Range(func(column int, values []parquet.Value) bool {
+					columnName := rowGroup.Schema().Columns()[column][0]
+					groupFilter, ok := groupFilters[columnName]
+					if !ok {
+						return true
+					}
+					for _, value := range values {
+						if !groupFilter(value) {
+							skip = true
+							return false
+						}
+					}
+					return true
+				})
+				if skip {
+					continue
+				}
+				groups[group] = append(groups[group], parquetRow)
+			}
+		}
 	}
-	return parquetRows, nil
+	println(fmt.Sprint(time.Since(start)))
+	if len(q.aggregators) > 0 {
+		for group, groupRows := range groups {
+			groupColumns := make([][]parquet.Value, len(rowGroup.Schema().Columns()))
+			for _, row := range groupRows {
+				row.Range(func(column int, v []parquet.Value) bool {
+					groupColumns[column] = append(groupColumns[column], v...)
+					return true
+				})
+			}
+			aggregate := parquet.Row{}
+			for column, values := range groupColumns {
+				columnName := rowGroup.Schema().Columns()[column][0]
+				if aggregator, ok := q.aggregators[group][columnName]; ok {
+					aggregate = append(aggregate, aggregator(values))
+				} else {
+					aggregate = append(aggregate, parquet.NullValue())
+				}
+			}
+			groups[group] = []parquet.Row{aggregate}
+		}
+	}
+	return groups, nil
 }
 
 // scanChunk checks the boundary for each page and applies the filter to each row in matching pages.

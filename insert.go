@@ -13,11 +13,10 @@ import (
 )
 
 type Ingestor[T Table] struct {
-	table      string
-	buffer     *parquet.GenericBuffer[T]
-	bucket     *Bucket
-	partitions map[string]catalog.Partition
-	ranges     map[string]catalog.Range
+	table  string
+	buffer *parquet.GenericBuffer[T]
+	bucket *Bucket
+	ranges map[string]catalog.Range
 }
 
 func NewIngestor[T Table](bucket *Bucket, sample T) *Ingestor[T] {
@@ -28,9 +27,8 @@ func NewIngestor[T Table](bucket *Bucket, sample T) *Ingestor[T] {
 				parquet.Ascending("timestamp"),
 			),
 		)),
-		bucket:     bucket,
-		partitions: map[string]catalog.Partition{},
-		ranges:     map[string]catalog.Range{},
+		bucket: bucket,
+		ranges: map[string]catalog.Range{},
 	}
 }
 
@@ -90,5 +88,5 @@ func (i *Ingestor[T]) Close(ctx context.Context) error {
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("failed to flush parquet writer: %v", err)
 	}
-	return i.bucket.write(ctx, i.table, output.Bytes(), i.partitions, i.ranges)
+	return i.bucket.write(ctx, i.table, output.Bytes(), i.ranges)
 }

@@ -17,14 +17,8 @@ type Table struct {
 type Shard struct {
 	Size   int    `json:"size"`
 	Target string `json:"target"`
-	// exact match statistic defined per column (e.g. to partition shards on low cardinality columns like "region")
-	Partitions map[string]Partition `json:"partitions"`
 	// range statistics defined per column.
 	Ranges map[string]Range `json:"ranges"`
-}
-
-type Partition struct {
-	Matches map[string]bool
 }
 
 type Range struct {

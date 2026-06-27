@@ -18,12 +18,6 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
-type RequestAggregate struct {
-	Timestamp lakedb.Int    `parquet:"timestamp,asc"`
-	Latency   lakedb.Int    `parquet:"latency"`
-	Endpoint  lakedb.String `parquet:"endpoint"`
-}
-
 type Request struct {
 	Timestamp lakedb.Int    `parquet:"timestamp,asc"`
 	Latency   lakedb.Int    `parquet:"latency"`
@@ -105,14 +99,29 @@ func TestOperations(t *testing.T) {
 	println("insert ", time.Since(start).String())
 
 	start = time.Now()
-	rows, err := lakedb.Query(t.Context(), bucket, Request{
-		Timestamp: lakedb.NewIntFilter().Lte(time.Now().Unix()).End(),
-		Latency:   lakedb.NewIntFilter().Lte(500000).End(),
-		Endpoint:  lakedb.NewStringFilter().Contains("Another Enedpoint").End(),
-	})
+	rows, err := lakedb.Query[Request]().
+		Where(Request{
+			Timestamp: lakedb.NewIntOp().Lte(time.Now().Unix()).End(),
+			Latency:   lakedb.NewIntOp().Lte(500000).End(),
+			Endpoint:  lakedb.NewStringFilter().Contains("Another Enedpoint").End(),
+		}).
+		Limit(2).
+		Scan(t.Context(), bucket)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	windows := []Request{
+		{Latency: lakedb.NewIntOp().Avg().End(), Timestamp: lakedb.NewIntOp().Max().End()},
+	}
+	err = lakedb.Query[Request]().Aggregate(t.Context(), bucket, windows)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	println("average ", windows[0].Latency.Data)
+	println("max ", windows[0].Timestamp.Data)
+
 	println("query ", time.Since(start).String())
 	println("total:")
 	println(len(rows))

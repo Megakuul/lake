@@ -36,11 +36,11 @@ func (d doubleOperation) min() any {
 }
 
 func (d doubleOperation) filter(v parquet.Value) bool {
-	if v.Kind() != parquet.Double64 {
+	if v.Kind() != parquet.Double {
 		return true
 	}
 	for _, op := range d.filterOps {
-		if !op(v.Double64()) {
+		if !op(v.Double()) {
 			return false
 		}
 	}
@@ -48,9 +48,9 @@ func (d doubleOperation) filter(v parquet.Value) bool {
 }
 
 func (d doubleOperation) aggregate(rows []parquet.Value) parquet.Value {
-	return parquet.Double64Value(d.aggregator(func(yield func(float64) bool) {
+	return parquet.DoubleValue(d.aggregator(func(yield func(float64) bool) {
 		for _, row := range rows {
-			if !yield(row.Double64()) {
+			if !yield(row.Double()) {
 				return
 			}
 		}
