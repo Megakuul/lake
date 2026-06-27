@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/megakuul/lakedb/catalog"
@@ -94,8 +93,6 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 	defer reader.Close()
 
 	count := 0
-	println("starting measure")
-	start := time.Now()
 	// groups create a mapping from groups and parquet rows. Global aggregations or scans should only use one group.
 	groups := make([][]parquet.Row, len(q.grouping))
 	for i := 0; i < len(rows); i++ {
@@ -112,6 +109,10 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 		batch := 1
 		for {
 			if len(rows) <= i+1 || !rows[i+1] {
+				break
+			}
+			count++
+			if q.limit != -1 && count > q.limit {
 				break
 			}
 			batch++
@@ -146,7 +147,6 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 			}
 		}
 	}
-	println(fmt.Sprint(time.Since(start)))
 	if len(q.aggregators) > 0 {
 		for group, groupRows := range groups {
 			groupColumns := make([][]parquet.Value, len(rowGroup.Schema().Columns()))

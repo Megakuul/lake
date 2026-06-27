@@ -114,7 +114,7 @@ func TestOperations(t *testing.T) {
 	windows := []Request{
 		{Latency: lakedb.NewIntOp().Avg().End(), Timestamp: lakedb.NewIntOp().Max().End()},
 	}
-	err = lakedb.Query[Request]().Aggregate(t.Context(), bucket, windows)
+	err = lakedb.Query[Request]().Limit(100000).Aggregate(t.Context(), bucket, windows)
 	if err != nil {
 		t.Fatal(err)
 	}
