@@ -1,8 +1,9 @@
-package lakedb
+package lake
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -89,86 +90,99 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 		}
 	}
 
+	if len(q.aggregators) > 0 {
+		groups := make([]map[string][]parquet.Value, len(q.grouping))
+		for group := range groups {
+			groups[group] = map[string][]parquet.Value{}
+		}
+		for _, chunk := range rowGroup.ColumnChunks() {
+			name := rowGroup.Schema().Columns()[chunk.Column()][0]
+
+			// pure optimization; checks if there is no planned aggregation for this chunk.
+			// if not, it immediately skips the full chunk.
+			skip := true
+			for _, aggregators := range q.aggregators {
+				if _, ok := aggregators[name]; ok {
+					skip = false
+				}
+			}
+			if skip {
+				continue
+			}
+
+			pager := chunk.Pages()
+			defer pager.Close()
+			for row := 0; row < len(rows); row++ {
+				if !rows[row] {
+					continue
+				}
+				if err = pager.SeekToRow(int64(row)); err != nil {
+					return nil, fmt.Errorf("failed to seek to row: %v", err)
+				}
+				page, err := pager.ReadPage()
+				if err != nil {
+					return nil, fmt.Errorf("failed to read page: %v", err)
+				}
+				batch := 0
+				for i := range page.NumRows() {
+					batch++
+					if !rows[int64(row)+i] {
+						break
+					}
+				}
+				row += batch - 1
+				buffer := make([]parquet.Value, batch)
+				n, err := page.Values().ReadValues(buffer)
+				if err != nil && !errors.Is(err, io.EOF) {
+					return nil, fmt.Errorf("failed to read page values: %v", err)
+				}
+				for _, value := range buffer[:n] {
+					for group, groupFilters := range q.grouping {
+						if groupFilter, ok := groupFilters[name]; !ok || groupFilter(value) {
+							groups[group][name] = append(groups[group][name], value)
+						}
+					}
+				}
+			}
+		}
+
+		result := make([][]parquet.Row, len(q.grouping))
+		for group, columns := range groups {
+			aggregatedRow := make(parquet.Row, 0, len(rowGroup.Schema().Columns()))
+			for _, column := range rowGroup.Schema().Columns() {
+				values := columns[column[0]]
+				aggregate, ok := q.aggregators[group][column[0]]
+				if ok {
+					aggregatedRow = append(aggregatedRow, aggregate(values))
+				} else {
+					aggregatedRow = append(aggregatedRow, parquet.NullValue())
+				}
+			}
+			result[group] = []parquet.Row{aggregatedRow}
+		}
+
+		return result, nil
+	}
+
 	reader := rowGroup.Rows()
 	defer reader.Close()
 
-	count := 0
-	// groups create a mapping from groups and parquet rows. Global aggregations or scans should only use one group.
-	groups := make([][]parquet.Row, len(q.grouping))
-	for i := 0; i < len(rows); i++ {
-		if !rows[i] {
+	result := make([][]parquet.Row, len(q.grouping))
+	for row, ok := range rows {
+		if !ok {
 			continue
 		}
-		count++
-		if q.limit != -1 && count > q.limit {
-			break
-		}
-		if err = reader.SeekToRow(int64(i)); err != nil {
+		if err = reader.SeekToRow(int64(row)); err != nil {
 			return nil, fmt.Errorf("failed to seek row: %v", err)
 		}
-		batch := 1
-		for {
-			if len(rows) <= i+1 || !rows[i+1] {
-				break
-			}
-			count++
-			if q.limit != -1 && count > q.limit {
-				break
-			}
-			batch++
-			i++
-		}
-		rowBuffer := make([]parquet.Row, batch)
+		rowBuffer := make([]parquet.Row, 1)
 		_, err := reader.ReadRows(rowBuffer)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read rows: %v", err)
 		}
-		for _, row := range rowBuffer {
-			for group, groupFilters := range q.grouping {
-				parquetRow, skip := row, false
-				parquetRow.Range(func(column int, values []parquet.Value) bool {
-					columnName := rowGroup.Schema().Columns()[column][0]
-					groupFilter, ok := groupFilters[columnName]
-					if !ok {
-						return true
-					}
-					for _, value := range values {
-						if !groupFilter(value) {
-							skip = true
-							return false
-						}
-					}
-					return true
-				})
-				if skip {
-					continue
-				}
-				groups[group] = append(groups[group], parquetRow)
-			}
-		}
+		result[0] = append(result[0], rowBuffer...)
 	}
-	if len(q.aggregators) > 0 {
-		for group, groupRows := range groups {
-			groupColumns := make([][]parquet.Value, len(rowGroup.Schema().Columns()))
-			for _, row := range groupRows {
-				row.Range(func(column int, v []parquet.Value) bool {
-					groupColumns[column] = append(groupColumns[column], v...)
-					return true
-				})
-			}
-			aggregate := parquet.Row{}
-			for column, values := range groupColumns {
-				columnName := rowGroup.Schema().Columns()[column][0]
-				if aggregator, ok := q.aggregators[group][columnName]; ok {
-					aggregate = append(aggregate, aggregator(values))
-				} else {
-					aggregate = append(aggregate, parquet.NullValue())
-				}
-			}
-			groups[group] = []parquet.Row{aggregate}
-		}
-	}
-	return groups, nil
+	return result, nil
 }
 
 // scanChunk checks the boundary for each page and applies the filter to each row in matching pages.

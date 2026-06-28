@@ -1,4 +1,4 @@
-package lakedb
+package lake
 
 import (
 	"reflect"
@@ -27,12 +27,16 @@ func getColumnName(field reflect.StructField) string {
 
 // aggregatable is implemented by column types that allow usage of an aggregator.
 type aggregatable interface {
+	// canAggregate tells if this field SHOULD even be aggregated (if no aggregation is defined this is false).
+	canAggregate() bool
 	// aggregate consolidates the provided row values into one value according to the implemented aggregator function.
 	aggregate([]parquet.Value) parquet.Value
 }
 
 // filterable is implemented by column types that allow custom value-per-value filters.
 type filterable interface {
+	// canFilter tells if this field SHOULD even be filtered (if no filter is defined this is false).
+	canFilter() bool
 	// filter checks an individual row value according to the implemented filter.
 	filter(parquet.Value) bool
 }

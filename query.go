@@ -1,4 +1,4 @@
-package lakedb
+package lake
 
 import (
 	"context"
@@ -43,10 +43,10 @@ func (b *QueryBuilder[T]) Where(filter T) *QueryBuilder[T] {
 			continue
 		}
 		columnName := getColumnName(columnMeta)
-		if filter, ok := filterValue.FieldByIndex(columnMeta.Index).Interface().(rangeFilter); ok {
+		if filter, ok := filterValue.FieldByIndex(columnMeta.Index).Interface().(boundable); ok {
 			ranges[columnName] = catalog.Range{Max: filter.max(), Min: filter.min()}
 		}
-		if filter, ok := filterValue.FieldByIndex(columnMeta.Index).Interface().(genericFilter); ok {
+		if filter, ok := filterValue.FieldByIndex(columnMeta.Index).Interface().(filterable); ok && filter.canFilter() {
 			checks[columnName] = filter.filter
 		}
 	}
@@ -76,7 +76,7 @@ func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error)
 	return result, nil
 }
 
-func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows []T) error {
+func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows ...T) ([]T, error) {
 	b.grouping = []map[string]func(parquet.Value) bool{}
 	b.aggregators = []map[string]func([]parquet.Value) parquet.Value{}
 
@@ -93,10 +93,10 @@ func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows
 				continue
 			}
 			columnName := getColumnName(columnMeta)
-			if filter, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(genericFilter); ok {
+			if filter, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(filterable); ok && filter.canFilter() {
 				b.grouping[i][columnName] = filter.filter
 			}
-			if aggregator, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(genericAggregator); ok {
+			if aggregator, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(aggregatable); ok && aggregator.canAggregate() {
 				b.aggregators[i][columnName] = aggregator.aggregate
 			}
 		}
@@ -106,12 +106,14 @@ func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows
 	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
 	groups, err := bucket.lookup(ctx, schema, &b.query)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	result := make([]T, len(windows))
 	for i, group := range groups {
-		if err = schema.Reconstruct(&windows[i], group[0]); err != nil {
-			return fmt.Errorf("failed to deserialize row: %v", err)
+		if err = schema.Reconstruct(&result[i], group[0]); err != nil {
+			return nil, fmt.Errorf("failed to deserialize row: %v", err)
 		}
 	}
-	return nil
+	return result, nil
 }

@@ -1,4 +1,4 @@
-package lakedb
+package lake
 
 import "iter"
 

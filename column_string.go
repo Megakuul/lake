@@ -1,4 +1,4 @@
-package lakedb
+package lake
 
 import (
 	"github.com/parquet-go/parquet-go"
@@ -32,23 +32,23 @@ func FilterString(filters ...Filter[string]) String {
 	return f
 }
 
-func (f String) higher(than any) (any, bool) {
+func (s String) higher(than any) (any, bool) {
 	if than, ok := than.(string); ok {
-		return &f.Data, f.Data > than
+		return &s.Data, s.Data > than
 	}
 	return nil, false
 }
 
-func (f String) lower(than any) (any, bool) {
+func (s String) lower(than any) (any, bool) {
 	if than, ok := than.(string); ok {
-		return &f.Data, f.Data < than
+		return &s.Data, s.Data < than
 	}
 	return nil, false
 }
 
-func (f String) max() any {
+func (s String) max() any {
 	var max *string
-	for _, filter := range f.filters {
+	for _, filter := range s.filters {
 		if filter.max != nil && (max == nil || *max < *filter.max) {
 			max = filter.max
 		}
@@ -60,9 +60,9 @@ func (f String) max() any {
 	}
 }
 
-func (f String) min() any {
+func (s String) min() any {
 	var min *string
-	for _, filter := range f.filters {
+	for _, filter := range s.filters {
 		if filter.min != nil && (min == nil || *min > *filter.min) {
 			min = filter.min
 		}
@@ -74,11 +74,15 @@ func (f String) min() any {
 	}
 }
 
-func (f String) filter(v parquet.Value) bool {
+func (s String) canFilter() bool {
+	return len(s.filters) != 0
+}
+
+func (s String) filter(v parquet.Value) bool {
 	if v.Kind() != parquet.ByteArray {
 		return true
 	}
-	for _, op := range f.filters {
+	for _, op := range s.filters {
 		if !op.check(string(v.ByteArray())) {
 			return false
 		}

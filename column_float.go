@@ -1,4 +1,4 @@
-package lakedb
+package lake
 
 import (
 	"github.com/parquet-go/parquet-go"
@@ -77,6 +77,10 @@ func (f Float) min() any {
 	}
 }
 
+func (f Float) canFilter() bool {
+	return len(f.filters) != 0
+}
+
 func (f Float) filter(v parquet.Value) bool {
 	if v.Kind() != parquet.Double {
 		return true
@@ -89,7 +93,14 @@ func (f Float) filter(v parquet.Value) bool {
 	return true
 }
 
+func (f Float) canAggregate() bool {
+	return f.aggregator != nil
+}
+
 func (f Float) aggregate(rows []parquet.Value) parquet.Value {
+	if f.aggregator == nil {
+		return parquet.NullValue()
+	}
 	return parquet.DoubleValue(f.aggregator(func(yield func(float64) bool) {
 		for _, row := range rows {
 			if !yield(row.Double()) {

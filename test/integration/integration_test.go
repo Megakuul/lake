@@ -14,14 +14,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
-	"github.com/megakuul/lakedb"
+	lake "github.com/megakuul/lakedb"
 	"github.com/parquet-go/parquet-go"
 )
 
 type Request struct {
-	Timestamp lakedb.Int    `parquet:"timestamp,asc"`
-	Latency   lakedb.Int    `parquet:"latency"`
-	Endpoint  lakedb.String `parquet:"endpoint"`
+	Timestamp lake.Int    `parquet:"timestamp"`
+	Latency   lake.Float  `parquet:"latency"`
+	Endpoint  lake.String `parquet:"endpoint"`
 }
 
 func (r Request) Name() string {
@@ -29,7 +29,9 @@ func (r Request) Name() string {
 }
 
 func (r Request) Sorting() parquet.SortingOption {
-	return nil
+	return parquet.SortingColumns(
+		parquet.Ascending("latency"),
+	)
 }
 
 func TestOperations(t *testing.T) {
@@ -62,18 +64,18 @@ func TestOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket, err := lakedb.NewFromClient(t.Context(), client, "test")
+	bucket, err := lake.NewFromClient(t.Context(), client, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	start := time.Now()
-	ingestor := lakedb.NewIngestor(bucket, Request{})
+	ingestor := lake.NewIngestor[Request](bucket)
 	for i := range int64(2) {
 		err = ingestor.Insert(t.Context(), Request{
-			Timestamp: lakedb.NewInt(69),
-			Latency:   lakedb.NewInt(i),
-			Endpoint:  lakedb.NewString("Another Enedpoint"),
+			Timestamp: lake.NewInt(69),
+			Latency:   lake.NewFloat(float64(i)),
+			Endpoint:  lake.NewString("Another Enedpoint"),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -82,12 +84,12 @@ func TestOperations(t *testing.T) {
 	if err = ingestor.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	ingestor = lakedb.NewIngestor(bucket, Request{})
+	ingestor = lake.NewIngestor[Request](bucket)
 	for i := range int64(5000000) {
 		err = ingestor.Insert(t.Context(), Request{
-			Timestamp: lakedb.NewInt(187),
-			Latency:   lakedb.NewInt(i + 500000),
-			Endpoint:  lakedb.NewString("Another Enedpoint"),
+			Timestamp: lake.NewInt(187),
+			Latency:   lake.NewFloat(float64(i + 500000)),
+			Endpoint:  lake.NewString("Another Enedpoint"),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -98,12 +100,10 @@ func TestOperations(t *testing.T) {
 	}
 	println("insert ", time.Since(start).String())
 
-	start = time.Now()
-	rows, err := lakedb.Query[Request]().
+	rows, err := lake.Query[Request]().
 		Where(Request{
-			Timestamp: lakedb.NewIntOp().Lte(time.Now().Unix()).End(),
-			Latency:   lakedb.NewIntOp().Lte(500000).End(),
-			Endpoint:  lakedb.NewStringFilter().Contains("Another Enedpoint").End(),
+			Timestamp: lake.FilterInt(lake.Before(time.Now())),
+			Endpoint:  lake.FilterString(lake.In("Another Enedpoint")),
 		}).
 		Limit(2).
 		Scan(t.Context(), bucket)
@@ -111,18 +111,19 @@ func TestOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	windows := []Request{
-		{Latency: lakedb.NewIntOp().Avg().End(), Timestamp: lakedb.NewIntOp().Max().End()},
-	}
-	err = lakedb.Query[Request]().Limit(100000).Aggregate(t.Context(), bucket, windows)
+	start = time.Now()
+	groups, err := lake.Query[Request]().Aggregate(t.Context(), bucket, Request{
+		Timestamp: lake.AggrInt(lake.Count),
+		// Latency:   lake.AggrFloat(lake.Sum),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	println("aggregate ", time.Since(start).String())
 
-	println("average ", windows[0].Latency.Data)
-	println("max ", windows[0].Timestamp.Data)
+	println("average ", groups[0].Latency.Data)
+	println("max ", groups[0].Timestamp.Data)
 
-	println("query ", time.Since(start).String())
 	println("total:")
 	println(len(rows))
 	t.Fail()
