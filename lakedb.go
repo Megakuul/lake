@@ -25,6 +25,12 @@ func getColumnName(field reflect.StructField) string {
 	return tag[0]
 }
 
+// groupable is implemented by column types that allow custom grouping derivation functionality.
+type groupable interface {
+	canGroup() bool
+	group(parquet.Value) (string, parquet.Value)
+}
+
 // aggregatable is implemented by column types that allow usage of an aggregator.
 type aggregatable interface {
 	// canAggregate tells if this field SHOULD even be aggregated (if no aggregation is defined this is false).

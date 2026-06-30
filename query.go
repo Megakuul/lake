@@ -21,8 +21,8 @@ func Query[T Table]() *QueryBuilder[T] {
 		ranges:      map[string]catalog.Range{},
 		checks:      map[string]func(parquet.Value) bool{},
 		limit:       -1,
-		grouping:    []map[string]func(parquet.Value) bool{},
-		aggregators: []map[string]func([]parquet.Value) parquet.Value{},
+		grouping:    map[string]func(parquet.Value) (string, parquet.Value){},
+		aggregators: map[string]func([]parquet.Value) parquet.Value{},
 	}}
 }
 
@@ -55,65 +55,54 @@ func (b *QueryBuilder[T]) Where(filter T) *QueryBuilder[T] {
 	return b
 }
 
-func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error) {
-	// use one empty group (match everything into the group) for the scan.
-	b.grouping = []map[string]func(parquet.Value) bool{{}}
+func (b *QueryBuilder[T]) GroupBy(grouping T) *QueryBuilder[T] {
+	groupingValue := reflect.ValueOf(grouping)
+	if !groupingValue.IsValid() {
+		panic("invalid input grouping type (expected table struct)")
+	}
+	for columnMeta := range groupingValue.Fields() {
+		if !columnMeta.IsExported() {
+			continue
+		}
+		columnName := getColumnName(columnMeta)
+		if grouper, ok := groupingValue.FieldByIndex(columnMeta.Index).Interface().(groupable); ok && grouper.canGroup() {
+			b.grouping[columnName] = grouper.group
+		}
+	}
+	return b
+}
 
+func (b *QueryBuilder[T]) Aggregate(aggregates T) *QueryBuilder[T] {
+	aggregatesValue := reflect.ValueOf(aggregates)
+	if !aggregatesValue.IsValid() {
+		panic("invalid input aggregates type (expected table struct)")
+	}
+	for columnMeta := range aggregatesValue.Fields() {
+		if !columnMeta.IsExported() {
+			continue
+		}
+		columnName := getColumnName(columnMeta)
+		if aggregator, ok := aggregatesValue.FieldByIndex(columnMeta.Index).Interface().(aggregatable); ok && aggregator.canAggregate() {
+			b.aggregators[columnName] = aggregator.aggregate
+		}
+	}
+	return b
+}
+
+func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error) {
 	pseudo := *new(T)
 	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
-	groups, err := bucket.lookup(ctx, schema, &b.query)
+	rows, err := bucket.lookup(ctx, schema, &b.query)
 	if err != nil {
 		return nil, err
 	}
-	result := make([]T, 0, len(groups[0]))
-	for _, row := range groups[0] {
+	result := make([]T, 0, len(rows))
+	for _, row := range rows {
 		var outputRow T
 		if err = schema.Reconstruct(&outputRow, row); err != nil {
 			return nil, fmt.Errorf("failed to deserialize row: %v", err)
 		}
 		result = append(result, outputRow)
-	}
-	return result, nil
-}
-
-func (b *QueryBuilder[T]) Aggregate(ctx context.Context, bucket *Bucket, windows ...T) ([]T, error) {
-	b.grouping = []map[string]func(parquet.Value) bool{}
-	b.aggregators = []map[string]func([]parquet.Value) parquet.Value{}
-
-	for i, window := range windows {
-		b.grouping = append(b.grouping, map[string]func(parquet.Value) bool{})
-		b.aggregators = append(b.aggregators, map[string]func([]parquet.Value) parquet.Value{})
-
-		windowValue := reflect.ValueOf(window)
-		if !windowValue.IsValid() {
-			panic("invalid aggregator window type (expected struct)")
-		}
-		for columnMeta := range windowValue.Fields() {
-			if !columnMeta.IsExported() {
-				continue
-			}
-			columnName := getColumnName(columnMeta)
-			if filter, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(filterable); ok && filter.canFilter() {
-				b.grouping[i][columnName] = filter.filter
-			}
-			if aggregator, ok := windowValue.FieldByIndex(columnMeta.Index).Interface().(aggregatable); ok && aggregator.canAggregate() {
-				b.aggregators[i][columnName] = aggregator.aggregate
-			}
-		}
-	}
-
-	pseudo := *new(T)
-	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
-	groups, err := bucket.lookup(ctx, schema, &b.query)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]T, len(windows))
-	for i, group := range groups {
-		if err = schema.Reconstruct(&result[i], group[0]); err != nil {
-			return nil, fmt.Errorf("failed to deserialize row: %v", err)
-		}
 	}
 	return result, nil
 }

@@ -22,7 +22,7 @@ type query struct {
 	ranges      map[string]catalog.Range
 	checks      map[string]func(parquet.Value) bool
 	limit       int // if set to -1 there is no limit
-	grouping    map[string]func(parquet.Value) string
+	grouping    map[string]func(parquet.Value) (string, parquet.Value)
 	aggregators map[string]func([]parquet.Value) parquet.Value
 }
 
@@ -60,12 +60,16 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 		return nil, fmt.Errorf("failed to merge row groups: %v", err)
 	}
 
+	type chunkKey struct {
+		hash  string
+		exact parquet.Value
+	}
+
 	// TODO this could be a bitset instead to reduce size from chunk.NumValues() * 1 byte -> chunk.NumValues() * 1 bit
 	// but linus, why is this not a map anymore?
 	// -> It's a tragedy I know, even the cpu cache misses the map ^^
-	rows := make([]bool, rowGroup.NumRows())
-
-	groupColumns := groupHashmap{}
+	rows := make([]parquet.Row, rowGroup.NumRows())
+	rowGrouping := make([][]chunkKey, rowGroup.NumRows())
 
 	for _, chunk := range rowGroup.ColumnChunks() {
 		columnName := rowGroup.Schema().Columns()[chunk.Column()][0]
@@ -74,32 +78,19 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 			chunkCheck = check
 		}
 
-		assignToGroup := func(parquet.Value) {}
+		assignToGroup := func(int, parquet.Value) {}
 		derive, ok := q.grouping[columnName]
 		if ok {
-			assignToGroup = func(value parquet.Value) {
-				id := derive(value)
-				if groups, ok := groupColumns[chunk.Column()]; ok {
-					create := true
-					for _, existing := range groups[id] {
-						if parquet.Equal(existing.match, value) {
-							existing.values = append(existing.values, value)
-							create = false
-							break
-						}
-					}
-					if create {
-						groups[id] = append(groups[id], groupBucket{match: value, values: []parquet.Value{value}})
-					}
-				} else {
-					groupColumns[chunk.Column()] = map[string][]groupBucket{
-						id: {{match: value, values: []parquet.Value{value}}},
-					}
+			assignToGroup = func(row int, value parquet.Value) {
+				if len(rowGrouping[row]) == 0 {
+					rowGrouping[row] = make([]chunkKey, len(rowGroup.Schema().Columns()))
 				}
+				hash, value := derive(value)
+				rowGrouping[row][chunk.Column()] = chunkKey{hash, value}
 			}
 		}
 
-		matches := make([]bool, rowGroup.NumRows())
+		matches := make([]parquet.Row, rowGroup.NumRows())
 		if err := scanChunk(chunk, matches, assignToGroup, q.ranges[columnName], chunkCheck); err != nil {
 			return nil, fmt.Errorf("failed scan chunk: %v", err)
 		}
@@ -109,38 +100,65 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 			continue
 		}
 		// subsequent matches will just remove non-matching values from base (column filters are always AND joined).
-		for row, ok := range rows {
-			if ok && matches[row] {
+		for i, row := range rows {
+			if len(row) > 0 && len(matches[i]) > 0 {
+				rows[i] = append(rows[i], matches[i]...)
 				continue
 			}
-			rows[row] = false
+			rows[i] = nil
 		}
 	}
 
 	// enforce limit
-	count := 0
-	for row, ok := range rows {
-		if !ok {
-			continue
-		}
-		count++
-		if count > q.limit {
-			rows[row] = false
-		}
+	if q.limit > 0 {
+		rows = rows[:q.limit]
+		rowGrouping = rowGrouping[:q.limit]
 	}
 
 	if len(q.aggregators) > 0 {
 		result := make([]parquet.Row, 0)
-		rows := map[string][]groupBucket{}
-		for column, groups := range groupColumns {
-			for id, buckets := range groups {
-				for _, bucket := range buckets {
-					if aggregate, ok := q.aggregators[column]; ok {
-						rows[id] = append(rows[id])
-						aggregated := aggregate(bucket.values)
-					}
-				}
+
+		groups := newHashmap[[][]parquet.Value]()
+		for i, row := range rows {
+			if len(row) < 1 {
+				continue
 			}
+			groupingKey := rowGrouping[i]
+			groupingHash, groupingChain := "", []parquet.Value{}
+			for _, chunkKey := range groupingKey {
+				groupingHash += chunkKey.hash
+				groupingChain = append(groupingChain, chunkKey.exact)
+			}
+			columns, ok := groups.get(groupingHash, groupingChain)
+			if !ok {
+				columns = make([][]parquet.Value, len(rowGroup.Schema().Columns()))
+			}
+			for _, value := range row {
+				columns[value.Column()] = append(columns[value.Column()], value)
+			}
+			groups.set(groupingHash, groupingChain, columns)
+		}
+		for hash, keyChain := range groups.keys() {
+			columns, ok := groups.get(hash, keyChain)
+			if !ok {
+				continue
+			}
+			aggregated := make(parquet.Row, 0, len(columns))
+			for column, values := range columns {
+				columnName := rowGroup.Schema().Columns()[column][0]
+				aggregate, ok := q.aggregators[columnName]
+				if !ok {
+					if group, ok := q.grouping[columnName]; ok {
+						_, derived := group(values[0])
+						aggregated = append(aggregated, derived)
+					} else {
+						aggregated = append(aggregated, parquet.NullValue())
+					}
+					continue
+				}
+				aggregated = append(aggregated, aggregate(values))
+			}
+			result = append(result, aggregated)
 		}
 		return result, nil
 	}
@@ -148,32 +166,27 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 	reader := rowGroup.Rows()
 	defer reader.Close()
 
-	result := make([]parquet.Row, count)
-	for row, ok := range rows {
-		if !ok {
+	result := make([]parquet.Row, 0)
+	for i, row := range rows {
+		if len(row) < 1 {
 			continue
 		}
-		if err = reader.SeekToRow(int64(row)); err != nil {
+		if err = reader.SeekToRow(int64(i)); err != nil {
 			return nil, fmt.Errorf("failed to seek row: %v", err)
 		}
-		_, err := reader.ReadRows(result[row : row+1])
+		buffer := make([]parquet.Row, 1)
+		_, err := reader.ReadRows(buffer)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read rows: %v", err)
 		}
+		result = append(result, buffer...)
 	}
 	return result, nil
 }
 
-type groupHashmap map[int]map[string][]groupBucket
-
-type groupBucket struct {
-	match  parquet.Value
-	values []parquet.Value
-}
-
 // scanChunk checks the boundary for each page and applies the filter to each row in matching pages.
 // It marks all passing rows in the provided rows map as true.
-func scanChunk(chunk parquet.ColumnChunk, rows []bool, assignToGroup func(parquet.Value), filterRange catalog.Range, check func(parquet.Value) bool) error {
+func scanChunk(chunk parquet.ColumnChunk, rows []parquet.Row, assignToGroup func(int, parquet.Value), filterRange catalog.Range, check func(parquet.Value) bool) error {
 	pages := chunk.Pages()
 	defer pages.Close()
 
@@ -241,9 +254,9 @@ func scanChunk(chunk parquet.ColumnChunk, rows []bool, assignToGroup func(parque
 			if int(firstPageRow)+valueIdx >= len(rows) {
 				return fmt.Errorf("more rows then values in column chunk this is not allowed by lakedb!")
 			}
-			rows[firstPageRow+int64(valueIdx)] = true
+			rows[firstPageRow+int64(valueIdx)] = append(rows[firstPageRow+int64(valueIdx)], value)
 
-			assignToGroup(value)
+			assignToGroup(int(firstPageRow)+valueIdx, value)
 		}
 	}
 	return nil

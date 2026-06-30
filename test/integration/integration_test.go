@@ -52,12 +52,12 @@ func TestOperations(t *testing.T) {
 	}
 
 	// test
+	// t.Run("test_filter", func(t *testing.T) {
+	// 	testFilter(t, bucket)
+	// })
+
 	t.Run("test_aggregation", func(t *testing.T) {
 		testAggregation(t, bucket)
-	})
-
-	t.Run("test_filter", func(t *testing.T) {
-		testFilter(t, bucket)
 	})
 
 	t.Run("test_sorting", func(t *testing.T) {

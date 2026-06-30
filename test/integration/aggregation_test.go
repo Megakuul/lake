@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -65,7 +66,7 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 		RequestorIQ: lake.NewFloat(requestorIq[3]),
 	})
 	generatedIroncladLatency, generatedRequestorIq := []int64{}, []float64{}
-	for i := range int64(50000) {
+	for i := range int64(5000000) {
 		generatedIroncladLatency = append(generatedIroncladLatency, i)
 		generatedRequestorIq = append(generatedRequestorIq, float64(i)*0.3)
 		if i%2 == 0 {
@@ -104,42 +105,31 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 	}
 
 	// execute
-	orderedByService, err := lake.Query[Request]().
+	orderedByEndpoint, err := lake.Query[Request]().
 		Where(Request{
 			Timestamp: lake.FilterInt(lake.After(now.Add(-time.Second))),
 			Static:    800,                                 // should not do anything
 			ignore:    lake.FilterFloat(lake.Eq(1337.420)), // should not do anything
 		}).
-		Aggregate(
-			t.Context(), bucket,
-			Request{Latency: lake.AggrInt(lake.Avg), RequestorIQ: lake.AggrFloat(lake.Sum), Endpoint: lake.AggrString(lake.Eq("ironclad"))},
-			Request{Latency: lake.AggrInt(lake.Avg), RequestorIQ: lake.AggrFloat(lake.Sum), Endpoint: lake.AggrString(lake.Eq("elephant"))},
-		)
-	if err != nil {
-		t.Fatal(err)
-	}
-	orderedByTime, err := lake.Query[Request]().
-		Where(Request{Timestamp: lake.FilterInt(lake.After(now.Add(time.Minute)))}).
-		Aggregate(
-			t.Context(), bucket,
-			Request{Timestamp: lake.AggrInt(nil, lake.Before(now.Add(time.Minute))), RequestorIQ: lake.AggrFloat(lake.Count)},
-			Request{Timestamp: lake.AggrInt(nil, lake.After(now.Add(time.Minute))), RequestorIQ: lake.AggrFloat(lake.Count)},
-		)
+		GroupBy(Request{
+			Endpoint: lake.GroupString(lake.Exact),
+		}).
+		Aggregate(Request{
+			Latency: lake.AggrInt(lake.Avg),
+		}).
+		Scan(t.Context(), bucket)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	println(len(orderedByEndpoint))
+	for _, result := range orderedByEndpoint {
+		println(fmt.Sprint(result.Endpoint.Data))
+		println(fmt.Sprint(result.Latency.Data))
+	}
 	// assert
-	if orderedByService[0].Latency.Data != 4 {
-		t.Fatalf("filter operation did not work properly; expected '4' got '%d'", len(logsBeforeIncident))
-	}
-	if len(logsAfterIncident) != 1 {
-		t.Fatalf("filter operation did not work properly; expected '1' got '%d'", len(logsAfterIncident))
-	}
-	if len(logsFromCamera) != 2 {
-		t.Fatalf("filter operation did not work properly; expected '2' got '%d'", len(logsFromCamera))
-	}
-	if len(logsFromOthers) != 3 {
-		t.Fatalf("filter operation did not work properly; expected '3' got '%d'", len(logsFromOthers))
-	}
+	// if orderedByService[0].Latency.Data != ironcladLatencies {
+	// 	t.Fatalf("filter operation did not work properly; expected '4' got '%d'", len(logsBeforeIncident))
+	// }
+	t.Fail()
 }

@@ -7,10 +7,12 @@ import (
 var (
 	_ filterable = String{}
 	_ boundable  = String{}
+	_ groupable  = String{}
 )
 
 type String struct {
 	filters []Filter[string]
+	grouper Grouper
 	Data    string `parquet:"data"`
 }
 
@@ -18,11 +20,8 @@ func NewString(value string) String {
 	return String{Data: value}
 }
 
-func AggrString(grouping ...Filter[string]) String {
-	f := String{
-		filters: grouping,
-	}
-	return f
+func GroupString(grouper Grouper) String {
+	return String{grouper: grouper}
 }
 
 func FilterString(filters ...Filter[string]) String {
@@ -72,6 +71,14 @@ func (s String) min() any {
 	} else {
 		return *min
 	}
+}
+
+func (s String) canGroup() bool {
+	return s.grouper != nil
+}
+
+func (s String) group(value parquet.Value) (string, parquet.Value) {
+	return s.grouper(value)
 }
 
 func (s String) canFilter() bool {
