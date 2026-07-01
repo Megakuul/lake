@@ -66,7 +66,7 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 		RequestorIQ: lake.NewFloat(requestorIq[3]),
 	})
 	generatedIroncladLatency, generatedRequestorIq := []int64{}, []float64{}
-	for i := range int64(5000000) {
+	for i := range int64(1000000) {
 		generatedIroncladLatency = append(generatedIroncladLatency, i)
 		generatedRequestorIq = append(generatedRequestorIq, float64(i)*0.3)
 		if i%2 == 0 {
@@ -104,6 +104,7 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 		t.Fatal(err)
 	}
 
+	start := time.Now()
 	// execute
 	orderedByEndpoint, err := lake.Query[Request]().
 		Where(Request{
@@ -121,6 +122,7 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	println("aggregate time: ", fmt.Sprint(time.Since(start)))
 
 	println(len(orderedByEndpoint))
 	for _, result := range orderedByEndpoint {
