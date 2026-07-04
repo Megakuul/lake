@@ -28,6 +28,8 @@ func In[T float64 | int64 | string](operands ...T) Filter[T] {
 
 func Before(operand time.Time) Filter[int64] {
 	return Filter[int64]{
+		max: new(operand.Unix()),
+		min: nil,
 		check: func(left int64) bool {
 			return time.Unix(left, 0).Before(operand)
 		},
@@ -36,6 +38,8 @@ func Before(operand time.Time) Filter[int64] {
 
 func After(operand time.Time) Filter[int64] {
 	return Filter[int64]{
+		max: nil,
+		min: new(operand.Unix()),
 		check: func(left int64) bool {
 			return time.Unix(left, 0).After(operand)
 		},

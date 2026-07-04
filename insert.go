@@ -11,6 +11,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
+// Ingestor provides a processor for one batch of input data.
 type Ingestor[T Table] struct {
 	table  string
 	buffer *parquet.GenericBuffer[T]
@@ -30,6 +31,7 @@ func NewIngestor[T Table](bucket *Bucket) *Ingestor[T] {
 	}
 }
 
+// insert writes the provided parquet row to the processor. This does NOT write anything to disk.
 func (i *Ingestor[T]) Insert(ctx context.Context, row T) error {
 	rowValue := reflect.ValueOf(row)
 	if !rowValue.IsValid() {
@@ -56,6 +58,7 @@ func (i *Ingestor[T]) Insert(ctx context.Context, row T) error {
 	return err
 }
 
+// Close writes the ingested rows into the underlying storage.
 func (i *Ingestor[T]) Close(ctx context.Context) error {
 	sort.Sort(i.buffer)
 

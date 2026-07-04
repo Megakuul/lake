@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
+	"math/big"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -39,7 +39,7 @@ type row struct {
 }
 
 // lookup uses the provided ranges and checks to efficiently find all matching rows.
-func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) ([]parquet.Row, error) {
+func (b *Bucket) aggregate(ctx context.Context, schema *parquet.Schema, q *query) ([]parquet.Row, error) {
 	start := time.Now()
 	b.catalogLock.RLock()
 	defer b.catalogLock.RUnlock()
@@ -76,136 +76,130 @@ func (b *Bucket) lookup(ctx context.Context, schema *parquet.Schema, q *query) (
 	println("catalog, merge and from disk: ", fmt.Sprint(time.Since(start)))
 	start = time.Now()
 
-	// TODO this could be a bitset instead to reduce size from chunk.NumValues() * 1 byte -> chunk.NumValues() * 1 bit
-	// but linus, why is this not a map anymore?
-	// -> It's a tragedy I know, even the cpu cache misses the map ^^
-	rows := make([]row, rowGroup.NumRows())
+	filterColumns, err := createFilterColumns(rowGroup.Schema(), q)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, chunk := range rowGroup.ColumnChunks() {
-		columnName := rowGroup.Schema().Columns()[chunk.Column()][0]
-		chunkCheck := func(parquet.Value) bool { return true }
-		if check, ok := q.checks[columnName]; ok {
-			chunkCheck = check
-		}
+	// rows is a bitset compressed '[]bool{}' that maps row positions to their "match" status.
+	var rows *big.Int
 
-		assignToGroup := func(int, parquet.Value) {}
-		derive, ok := q.grouping[columnName]
-		if ok {
-			assignToGroup = func(row int, value parquet.Value) {
-				if len(rows[row].group) == 0 {
-					rows[row].group = make([]chunkKey, len(rowGroup.Schema().Columns()))
-				}
-				hash, value := derive(value)
-				rows[row].group[chunk.Column()] = chunkKey{hash, value}
-			}
-		}
-
-		salami := time.Now()
-		matches := make([]row, rowGroup.NumRows())
-		if err := scanChunk(chunk, matches, assignToGroup, q.ranges[columnName], chunkCheck); err != nil {
+	for i, filterColumn := range filterColumns {
+		println(filterColumn.name)
+		chunk := rowGroup.ColumnChunks()[filterColumn.index]
+		var matches big.Int
+		if err := scanChunk(chunk, &matches, rows, filterColumn.chunkRange, filterColumn.chunkCheck); err != nil {
 			return nil, fmt.Errorf("failed scan chunk: %v", err)
 		}
-		println("chunk time: ", columnName, fmt.Sprint(time.Since(salami)))
-		// take the set from the first column as base.
-		if chunk.Column() == 0 {
-			rows = matches
+		// first column captures all matches
+		if i == 0 {
+			rows = &matches
 			continue
 		}
-		// subsequent matches will just remove non-matching values from base (column filters are always AND joined).
-		for i, row := range rows {
-			if len(row.values) > 0 && len(matches[i].values) > 0 {
-				rows[i].values = append(rows[i].values, matches[i].values...)
-				continue
+		// other columns just remove bits from rows
+		for row := range rows.BitLen() {
+			if rows.Bit(row) == 1 && matches.Bit(row) == 0 {
+				rows.SetBit(rows, row, 0)
 			}
-			rows[i].values = nil
 		}
 	}
 
 	println("grouping and filtering: ", fmt.Sprint(time.Since(start)))
 	start = time.Now()
 
-	// enforce limit
-	if q.limit > 0 {
-		rows = rows[:q.limit]
+	count := 0
+	for row := range rows.BitLen() {
+		if rows.Bit(row) == 0 {
+			continue
+		}
+		count++
 	}
+
+	println("total: ", count)
+
+	// enforce limit
+	// if q.limit > 0 {
+	// 	rows = rows[:q.limit]
+	// }
 
 	println("limiting: ", fmt.Sprint(time.Since(start)))
 	start = time.Now()
 
-	if len(q.aggregators) > 0 {
-		result := make([]parquet.Row, 0)
-
-		groups := newHashmap[[][]parquet.Value]()
-		for i, row := range rows {
-			if len(row.values) < 1 {
-				continue
-			}
-			groupingHash, groupingChain := strings.Builder{}, []parquet.Value{}
-			for _, chunkKey := range rows[i].group {
-				groupingHash.WriteString(chunkKey.hash)
-				groupingChain = append(groupingChain, chunkKey.exact)
-			}
-			columns, ok := groups.get(groupingHash.String(), groupingChain)
-			if !ok {
-				columns = make([][]parquet.Value, len(rowGroup.Schema().Columns()))
-			}
-			for _, value := range row.values {
-				columns[value.Column()] = append(columns[value.Column()], value)
-			}
-			groups.set(groupingHash.String(), groupingChain, columns)
-		}
-		for hash, keyChain := range groups.keys() {
-			columns, ok := groups.get(hash, keyChain)
-			if !ok {
-				continue
-			}
-			aggregated := make(parquet.Row, 0, len(columns))
-			for column, values := range columns {
-				columnName := rowGroup.Schema().Columns()[column][0]
-				aggregate, ok := q.aggregators[columnName]
-				if !ok {
-					if group, ok := q.grouping[columnName]; ok {
-						_, derived := group(values[0])
-						aggregated = append(aggregated, derived)
-					} else {
-						aggregated = append(aggregated, parquet.NullValue())
-					}
-					continue
-				}
-				aggregated = append(aggregated, aggregate(values))
-			}
-			result = append(result, aggregated)
-		}
-
-		println("aggregating: ", fmt.Sprint(time.Since(start)))
-		start = time.Now()
-		return result, nil
-	}
-
-	reader := rowGroup.Rows()
-	defer reader.Close()
-
 	result := make([]parquet.Row, 0)
-	for i, row := range rows {
-		if len(row.values) < 1 {
-			continue
-		}
-		if err = reader.SeekToRow(int64(i)); err != nil {
-			return nil, fmt.Errorf("failed to seek row: %v", err)
-		}
-		buffer := make([]parquet.Row, 1)
-		_, err := reader.ReadRows(buffer)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read rows: %v", err)
-		}
-		result = append(result, buffer...)
-	}
 	return result, nil
+	//
+	// groups := newHashmap[[][]parquet.Value]()
+	// for row, ok := range rows {
+	// 	if ok {
+	// 		continue
+	// 	}
+	// 	groupingHash, groupingChain := strings.Builder{}, []parquet.Value{}
+	// 	for _, chunkKey := range rows[i].group {
+	// 		groupingHash.WriteString(chunkKey.hash)
+	// 		groupingChain = append(groupingChain, chunkKey.exact)
+	// 	}
+	// 	columns, ok := groups.get(groupingHash.String(), groupingChain)
+	// 	if !ok {
+	// 		columns = make([][]parquet.Value, len(rowGroup.Schema().Columns()))
+	// 	}
+	// 	for _, value := range row.values {
+	// 		columns[value.Column()] = append(columns[value.Column()], value)
+	// 	}
+	// 	groups.set(groupingHash.String(), groupingChain, columns)
+	// }
+	// for hash, keyChain := range groups.keys() {
+	// 	columns, ok := groups.get(hash, keyChain)
+	// 	if !ok {
+	// 		continue
+	// 	}
+	// 	aggregated := make(parquet.Row, 0, len(columns))
+	// 	for column, values := range columns {
+	// 		columnName := rowGroup.Schema().Columns()[column][0]
+	// 		aggregate, ok := q.aggregators[columnName]
+	// 		if !ok {
+	// 			if group, ok := q.grouping[columnName]; ok {
+	// 				_, derived := group(values[0])
+	// 				aggregated = append(aggregated, derived)
+	// 			} else {
+	// 				aggregated = append(aggregated, parquet.NullValue())
+	// 			}
+	// 			continue
+	// 		}
+	// 		aggregated = append(aggregated, aggregate(values))
+	// 	}
+	// 	result = append(result, aggregated)
+	// }
+	//
+	// println("aggregating: ", fmt.Sprint(time.Since(start)))
+	// start = time.Now()
+	// return result, nil
+}
+
+func retrieve() {
+	// reader := rowGroup.Rows()
+	// defer reader.Close()
+	//
+	// result := make([]parquet.Row, 0)
+	// for i, row := range rows {
+	// 	if len(row.values) < 1 {
+	// 		continue
+	// 	}
+	// 	if err = reader.SeekToRow(int64(i)); err != nil {
+	// 		return nil, fmt.Errorf("failed to seek row: %v", err)
+	// 	}
+	// 	buffer := make([]parquet.Row, 1)
+	// 	_, err := reader.ReadRows(buffer)
+	// 	if err != nil && err != io.EOF {
+	// 		return nil, fmt.Errorf("failed to read rows: %v", err)
+	// 	}
+	// 	result = append(result, buffer...)
+	// }
+	// return result, nil
 }
 
 // scanChunk checks the boundary for each page and applies the filter to each row in matching pages.
 // It marks all passing rows in the provided rows map as true.
-func scanChunk(chunk parquet.ColumnChunk, rows []row, assignToGroup func(int, parquet.Value), filterRange catalog.Range, check func(parquet.Value) bool) error {
+func scanChunk(chunk parquet.ColumnChunk, matches, skip *big.Int, filterRange catalog.Range, check func(parquet.Value) bool) error {
 	pages := chunk.Pages()
 	defer pages.Close()
 
@@ -267,15 +261,13 @@ func scanChunk(chunk parquet.ColumnChunk, rows []row, assignToGroup func(int, pa
 			return fmt.Errorf("failed to read rows: %v", err)
 		}
 		for valueIdx, value := range values[:n] {
-			if !check(value) {
+			if skip != nil && skip.Bit(int(firstPageRow)+valueIdx) == 0 {
 				continue
 			}
-			if int(firstPageRow)+valueIdx >= len(rows) {
-				return fmt.Errorf("more rows then values in column chunk this is not allowed by lakedb!")
+			if check != nil && !check(value) {
+				continue
 			}
-			rows[firstPageRow+int64(valueIdx)].values = append(rows[firstPageRow+int64(valueIdx)].values, value)
-
-			assignToGroup(int(firstPageRow)+valueIdx, value)
+			matches.SetBit(matches, int(firstPageRow)+valueIdx, 1)
 		}
 	}
 	return nil

@@ -92,7 +92,7 @@ func (b *QueryBuilder[T]) Aggregate(aggregates T) *QueryBuilder[T] {
 func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error) {
 	pseudo := *new(T)
 	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
-	rows, err := bucket.lookup(ctx, schema, &b.query)
+	rows, err := bucket.aggregate(ctx, schema, &b.query)
 	if err != nil {
 		return nil, err
 	}
