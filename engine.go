@@ -85,7 +85,6 @@ func (b *Bucket) aggregate(ctx context.Context, schema *parquet.Schema, q *query
 	var rows *big.Int
 
 	for i, filterColumn := range filterColumns {
-		println(filterColumn.name)
 		chunk := rowGroup.ColumnChunks()[filterColumn.index]
 		var matches big.Int
 		if err := scanChunk(chunk, &matches, rows, filterColumn.chunkRange, filterColumn.chunkCheck); err != nil {
@@ -104,29 +103,142 @@ func (b *Bucket) aggregate(ctx context.Context, schema *parquet.Schema, q *query
 		}
 	}
 
-	println("grouping and filtering: ", fmt.Sprint(time.Since(start)))
+	println("filtering: ", fmt.Sprint(time.Since(start)))
 	start = time.Now()
 
-	count := 0
-	for row := range rows.BitLen() {
-		if rows.Bit(row) == 0 {
-			continue
-		}
-		count++
+	type group struct {
+		key  parquet.Value
+		rows big.Int
 	}
 
-	println("total: ", count)
+	columnGroups := map[string]map[string]*group{}
+	for columnIdx, column := range rowGroup.Schema().Columns() {
+		columnName := column[0]
+		grouping, ok := q.grouping[columnName]
+		if !ok {
+			continue
+		}
 
-	// enforce limit
-	// if q.limit > 0 {
-	// 	rows = rows[:q.limit]
-	// }
+		groups := map[string]*group{}
+		chunk := rowGroup.ColumnChunks()[columnIdx]
 
-	println("limiting: ", fmt.Sprint(time.Since(start)))
+		pages := chunk.Pages()
+		defer pages.Close()
+
+		offsetIndex, err := chunk.OffsetIndex()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read offset index: %v", err)
+		}
+
+		for pageIdx := range offsetIndex.NumPages() {
+			firstPageRow := offsetIndex.FirstRowIndex(pageIdx)
+
+			err := pages.SeekToRow(firstPageRow)
+			if err != nil {
+				return nil, fmt.Errorf("failed to seek to page row: %v", err)
+			}
+			page, err := pages.ReadPage()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read page: %v", err)
+			}
+			values := make([]parquet.Value, page.NumValues())
+			n, err := page.Values().ReadValues(values)
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("failed to read rows: %v", err)
+			}
+			for valueIdx, value := range values[:n] {
+				if rows.Bit(int(firstPageRow)+valueIdx) == 0 {
+					continue
+				}
+				hash, key := grouping(value)
+				valueGroup, ok := groups[hash]
+				if !ok {
+					valueGroup = &group{key: key}
+					groups[hash] = valueGroup
+				}
+				valueGroup.rows.SetBit(&valueGroup.rows, int(firstPageRow)+valueIdx, 1)
+			}
+		}
+		columnGroups[columnName] = groups
+	}
+
+	println("pre grouping: ", fmt.Sprint(time.Since(start)))
 	start = time.Now()
 
-	result := make([]parquet.Row, 0)
-	return result, nil
+	streams := newHashmap[big.Int]()
+	for row := range rows.BitLen() {
+		groupHash, groupKeys := "", []parquet.Value{}
+		for _, groups := range columnGroups {
+			for hash, group := range groups {
+				if group.rows.Bit(row) == 1 {
+					groupHash += hash
+					groupKeys = append(groupKeys, group.key)
+				}
+			}
+		}
+		stream, _ := streams.get(groupHash, groupKeys)
+		stream.SetBit(&stream, row, 1)
+		streams.set(groupHash, groupKeys, stream)
+	}
+
+	println("grouping: ", fmt.Sprint(time.Since(start)))
+	start = time.Now()
+
+	results := []parquet.Row{}
+	for hash, keys := range streams.keys() {
+		rows, _ := streams.get(hash, keys)
+		result := make(parquet.Row, len(rowGroup.Schema().Columns()))
+		for columnIdx, column := range rowGroup.Schema().Columns() {
+			columnName := column[0]
+			aggregate, ok := q.aggregators[columnName]
+			if !ok {
+				result[columnIdx] = parquet.NullValue()
+				continue
+			}
+			chunk := rowGroup.ColumnChunks()[columnIdx]
+
+			pages := chunk.Pages()
+			defer pages.Close()
+
+			offsetIndex, err := chunk.OffsetIndex()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read offset index: %v", err)
+			}
+
+			rawValues := []parquet.Value{}
+			for pageIdx := range offsetIndex.NumPages() {
+				firstPageRow := offsetIndex.FirstRowIndex(pageIdx)
+
+				err := pages.SeekToRow(firstPageRow)
+				if err != nil {
+					return nil, fmt.Errorf("failed to seek to page row: %v", err)
+				}
+				page, err := pages.ReadPage()
+				if err != nil {
+					return nil, fmt.Errorf("failed to read page: %v", err)
+				}
+				values := make([]parquet.Value, page.NumValues())
+				n, err := page.Values().ReadValues(values)
+				if err != nil && err != io.EOF {
+					return nil, fmt.Errorf("failed to read rows: %v", err)
+				}
+				for valueIdx, value := range values[:n] {
+					if rows.Bit(int(firstPageRow)+valueIdx) == 0 {
+						continue
+					}
+					rawValues = append(rawValues, value)
+				}
+			}
+			result[columnIdx] = aggregate(rawValues)
+		}
+
+		results = append(results, result)
+	}
+
+	println("aggregating: ", fmt.Sprint(time.Since(start)))
+	start = time.Now()
+
+	return results, nil
 	//
 	// groups := newHashmap[[][]parquet.Value]()
 	// for row, ok := range rows {
@@ -198,7 +310,7 @@ func retrieve() {
 }
 
 // scanChunk checks the boundary for each page and applies the filter to each row in matching pages.
-// It marks all passing rows in the provided rows map as true.
+// It marks passing values in the matches bitset and skips filters on rows already filtered out in the skip bitset.
 func scanChunk(chunk parquet.ColumnChunk, matches, skip *big.Int, filterRange catalog.Range, check func(parquet.Value) bool) error {
 	pages := chunk.Pages()
 	defer pages.Close()
@@ -209,7 +321,7 @@ func scanChunk(chunk parquet.ColumnChunk, matches, skip *big.Int, filterRange ca
 	}
 	offsetIndex, err := chunk.OffsetIndex()
 	if err != nil {
-		return fmt.Errorf("failed to read column index: %v", err)
+		return fmt.Errorf("failed to read offset index: %v", err)
 	}
 
 	scannablePages := []int64{}

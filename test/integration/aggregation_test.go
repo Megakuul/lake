@@ -108,8 +108,7 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 	// execute
 	orderedByEndpoint, err := lake.Query[Request]().
 		Where(Request{
-			Timestamp: lake.FilterInt(lake.Before(now.Add(time.Hour * 2))),
-			Endpoint:  lake.FilterString(lake.Eq("ironclad")),
+			Timestamp: lake.FilterInt(lake.After(now.Add(-time.Second))),
 			Static:    800,                                 // should not do anything
 			ignore:    lake.FilterFloat(lake.Eq(1337.420)), // should not do anything
 		}).
