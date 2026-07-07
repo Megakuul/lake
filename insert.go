@@ -7,24 +7,24 @@ import (
 	"reflect"
 	"sort"
 
-	"github.com/megakuul/lakedb/catalog"
+	"github.com/megakuul/lakedb/internal/catalog"
 	"github.com/parquet-go/parquet-go"
 )
 
 // Ingestor provides a processor for one batch of input data.
-type Ingestor[T Table] struct {
+type Ingestor[T any] struct {
 	table  string
 	buffer *parquet.GenericBuffer[T]
 	bucket *Bucket
 	ranges map[string]catalog.Range
 }
 
-func NewIngestor[T Table](bucket *Bucket) *Ingestor[T] {
-	pseudo := *new(T)
+func NewIngestor[T any](bucket *Bucket) *Ingestor[T] {
+	tableName, tableSorting := getMetadata(reflect.TypeFor[T]())
 	return &Ingestor[T]{
-		table: pseudo.Name(),
+		table: tableName,
 		buffer: parquet.NewGenericBuffer[T](parquet.SortingRowGroupConfig(
-			pseudo.Sorting(),
+			parquet.SortingColumns(tableSorting...),
 		)),
 		bucket: bucket,
 		ranges: map[string]catalog.Range{},

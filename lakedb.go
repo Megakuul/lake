@@ -1,26 +1,49 @@
 package lake
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/parquet-go/parquet-go"
 )
 
-// Table is the interface that must be implemented by all parquet table structs.
-type Table interface {
-	// Name defines the table name in parquet. It is a hard contract to the data.
-	Name() string
-	// Sorting defines the table column sorting.
-	Sorting() parquet.SortingOption
+// Table can be used as marker on any table to define metadata in the tag.
+type Table struct{}
+
+// getMetadata extracts metadata (name and sorting) from the provided table value.
+func getMetadata(table reflect.Type) (name string, sorting []parquet.SortingColumn) {
+	tableType := reflect.TypeFor[Table]()
+	for field := range table.Fields() {
+		if field.Type == tableType {
+			name = field.Tag.Get("name")
+			if field.Tag.Get("sort") == "" {
+				break
+			}
+			for rawSorting := range strings.SplitSeq(field.Tag.Get("sort"), ",") {
+				if column, ok := strings.CutSuffix(rawSorting, ":asc"); ok {
+					sorting = append(sorting, parquet.Ascending(column, "data")) // data is added because lake primitives use .data as subpath
+				} else if column, ok := strings.CutSuffix(rawSorting, ":desc"); ok {
+					sorting = append(sorting, parquet.Descending(column, "data")) // data is added because lake primitives use .data as subpath
+				} else {
+					panic(fmt.Sprintf("invalid sorting spec on table: got '%s' expected '<column>:asc|desc'", rawSorting))
+				}
+			}
+			break
+		}
+	}
+	if name == "" {
+		name = table.Name()
+	}
+	return name, sorting
 }
 
 // getColumnName extracts the parquet column name from a struct field.
 // It is compatible to the parquet library struct tagging system.
-func getColumnName(field reflect.StructField) string {
-	tag := strings.SplitN(field.Tag.Get("parquet"), ",", 2)
+func getColumnName(table reflect.StructField) string {
+	tag := strings.SplitN(table.Tag.Get("parquet"), ",", 2)
 	if len(tag) < 1 || tag[0] == "" {
-		return field.Name
+		return table.Name
 	}
 	return tag[0]
 }
@@ -28,7 +51,7 @@ func getColumnName(field reflect.StructField) string {
 // groupable is implemented by column types that allow custom grouping derivation functionality.
 type groupable interface {
 	canGroup() bool
-	group(parquet.Value) (uint64, parquet.Value)
+	group(parquet.Value) parquet.Value
 }
 
 // aggregatable is implemented by column types that allow usage of an aggregator.

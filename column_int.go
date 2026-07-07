@@ -96,7 +96,7 @@ func (i Int) canGroup() bool {
 	return i.grouper != nil
 }
 
-func (i Int) group(value parquet.Value) (uint64, parquet.Value) {
+func (i Int) group(value parquet.Value) parquet.Value {
 	return i.grouper(value)
 }
 

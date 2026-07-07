@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/megakuul/lakedb/catalog"
+	"github.com/megakuul/lakedb/internal/catalog"
 	"github.com/parquet-go/parquet-go"
 )
 

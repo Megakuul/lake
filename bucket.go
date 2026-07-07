@@ -15,10 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
-	"github.com/megakuul/lakedb/catalog"
+	"github.com/megakuul/lakedb/internal/catalog"
 )
 
 type Bucket struct {
@@ -45,7 +44,7 @@ func New(ctx context.Context, url, bucket string, opts ...BucketOption) (*Bucket
 		return nil, err
 	}
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(url)
+		o.BaseEndpoint = new(url)
 		o.UsePathStyle = true
 		for _, opt := range opts {
 			opt(o)

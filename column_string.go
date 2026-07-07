@@ -77,7 +77,7 @@ func (s String) canGroup() bool {
 	return s.grouper != nil
 }
 
-func (s String) group(value parquet.Value) (uint64, parquet.Value) {
+func (s String) group(value parquet.Value) parquet.Value {
 	return s.grouper(value)
 }
 

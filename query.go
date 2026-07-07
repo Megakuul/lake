@@ -6,22 +6,22 @@ import (
 	"maps"
 	"reflect"
 
-	"github.com/megakuul/lakedb/catalog"
+	"github.com/megakuul/lakedb/internal/catalog"
 	"github.com/parquet-go/parquet-go"
 )
 
 // QueryBuilder wraps the query structure with api exposed methods to construct it.
 // Generics are not strictly required here but make the api more userfriendly for autocompletion.
-type QueryBuilder[T Table] struct {
+type QueryBuilder[T any] struct {
 	query
 }
 
-func Query[T Table]() *QueryBuilder[T] {
+func Query[T any]() *QueryBuilder[T] {
 	return &QueryBuilder[T]{query: query{
 		ranges:      map[string]catalog.Range{},
 		checks:      map[string]func(parquet.Value) bool{},
 		limit:       -1,
-		grouping:    map[string]func(parquet.Value) (uint64, parquet.Value){},
+		grouping:    map[string]func(parquet.Value) parquet.Value{},
 		aggregators: map[string]func([]parquet.Value) parquet.Value{},
 	}}
 }
@@ -90,8 +90,9 @@ func (b *QueryBuilder[T]) Aggregate(aggregates T) *QueryBuilder[T] {
 }
 
 func (b *QueryBuilder[T]) Scan(ctx context.Context, bucket *Bucket) ([]T, error) {
-	pseudo := *new(T)
-	schema := parquet.NewSchema(pseudo.Name(), parquet.SchemaOf(pseudo))
+	tableName, tableSorting := getMetadata(reflect.TypeFor[T]())
+	b.sorting = tableSorting
+	schema := parquet.NewSchema(tableName, parquet.SchemaOf(*new(T)))
 	rows, err := bucket.process(ctx, schema, &b.query)
 	if err != nil {
 		return nil, err

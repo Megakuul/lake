@@ -96,7 +96,7 @@ func (s Float) canGroup() bool {
 	return s.grouper != nil
 }
 
-func (s Float) group(value parquet.Value) (uint64, parquet.Value) {
+func (s Float) group(value parquet.Value) parquet.Value {
 	return s.grouper(value)
 }
 

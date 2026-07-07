@@ -6,10 +6,10 @@ import (
 	"time"
 
 	lake "github.com/megakuul/lakedb"
-	"github.com/parquet-go/parquet-go"
 )
 
 type Request struct {
+	lake.Table  `name:"request" sort:"latency:desc,Timestamp:asc"`
 	Timestamp   lake.Int
 	Latency     lake.Int    `parquet:"latency"`
 	Endpoint    lake.String `parquet:"endpoint,ignoreme123"`
@@ -17,16 +17,6 @@ type Request struct {
 
 	ignore lake.Float `parquet:"ignore"`
 	Static float64    `parquet:"static"`
-}
-
-func (r Request) Name() string {
-	return "request"
-}
-
-func (r Request) Sorting() parquet.SortingOption {
-	return parquet.SortingColumns(
-		parquet.Ascending("timestamp"),
-	)
 }
 
 func testAggregation(t *testing.T, bucket *lake.Bucket) {
@@ -112,13 +102,13 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 			Static:    800,                                 // should not do anything
 			ignore:    lake.FilterFloat(lake.Eq(1337.420)), // should not do anything
 		}).
-		Limit(100).
 		GroupBy(Request{
-			Endpoint: lake.GroupString(lake.Exact),
-			Latency:  lake.GroupInt(lake.Exact),
+			Endpoint:  lake.GroupString(lake.Exact()),
+			Timestamp: lake.GroupInt(lake.Date(lake.DateYear)), // should do nothing since everything happened in the same day
 		}).
 		Aggregate(Request{
-			Latency: lake.AggrInt(lake.Avg),
+			Latency:     lake.AggrInt(lake.Avg),
+			RequestorIQ: lake.AggrFloat(lake.Sum),
 		}).
 		Scan(t.Context(), bucket)
 	if err != nil {
@@ -126,6 +116,38 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 	}
 	println("aggregate time: ", fmt.Sprint(time.Since(start)))
 
+	// assert
+	if len(orderedByEndpoint) != 2 {
+		t.Fatalf("incorrect grouping operation expected '2' result buckets got '%d'", len(orderedByEndpoint))
+	}
+	for _, result := range orderedByEndpoint {
+		// group by datetrunc year should set this to start of the year -> now - 1 leap year should be before this.
+		if now.Add(-time.Hour * 8784).After(time.Unix(result.Timestamp.Data-1, 0)) {
+			t.Fatalf("grouping did not correctly set timestamp group")
+		}
+		switch result.Endpoint.Data {
+		case "ironclad":
+			expected, combined := 0.0, append(ironcladLatencies[:], generatedIroncladLatency...)
+			for _, latency := range combined {
+				expected += float64(latency)
+			}
+			expected /= float64(len(combined))
+			if result.Latency.Data != int64(expected) {
+				t.Fatalf("ironclad latency average is off (expected '%d' got '%d')", result.Latency.Data, int(expected))
+			}
+		case "elephant":
+			expected, combined := 0.0, elephantLatencies[:]
+			for _, latency := range combined {
+				expected += float64(latency)
+			}
+			expected /= float64(len(combined))
+			if result.Latency.Data != int64(expected) {
+				t.Fatalf("elephant latency average is off (expected '%d' got '%d')", result.Latency.Data, int(expected))
+			}
+		default:
+			t.Fatalf("unexpected endpoint in returned row result")
+		}
+	}
 	println(len(orderedByEndpoint))
 	// for _, result := range orderedByEndpoint {
 	// 	println(fmt.Sprint(result.Endpoint.Data))
@@ -135,5 +157,4 @@ func testAggregation(t *testing.T, bucket *lake.Bucket) {
 	// if orderedByService[0].Latency.Data != ironcladLatencies {
 	// 	t.Fatalf("filter operation did not work properly; expected '4' got '%d'", len(logsBeforeIncident))
 	// }
-	t.Fail()
 }

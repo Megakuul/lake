@@ -3,14 +3,13 @@ package lake
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"hash/maphash"
 	"io"
 	"math/big"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/megakuul/lakedb/catalog"
+	"github.com/megakuul/lakedb/internal/catalog"
+	"github.com/megakuul/lakedb/internal/group"
 	"github.com/parquet-go/parquet-go"
 )
 
@@ -25,12 +24,17 @@ type query struct {
 	ranges      map[string]catalog.Range
 	checks      map[string]func(parquet.Value) bool
 	limit       int // if set to -1 there is no limit
-	grouping    map[string]func(parquet.Value) (uint64, parquet.Value)
+	grouping    map[string]func(parquet.Value) parquet.Value
 	aggregators map[string]func([]parquet.Value) parquet.Value
+
+	sorting []parquet.SortingColumn
 }
 
+// process performs the provided query / aggregation and returns the result (if aggregated it is just a row per group).
 func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) ([]parquet.Row, error) {
-	rowGroup, err := b.load(ctx, schema, q)
+	applyLimit, applyAggregation := q.limit > 0, len(q.aggregators) > 0
+
+	rowGroup, err := b.load(ctx, schema, !applyLimit && applyAggregation, q)
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +43,7 @@ func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) 
 		return nil, err
 	}
 
-	if q.limit > 0 {
+	if applyLimit {
 		var (
 			limitedRows big.Int
 			count       int
@@ -56,23 +60,24 @@ func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) 
 		rows = &limitedRows
 	}
 
-	if len(q.aggregators) < 1 {
+	if !applyAggregation {
 		return b.extract(rowGroup, rows) // without aggregators just extract and return full rows.
 	}
 
-	streams := newHashmap[big.Int]()
+	groups := group.NewHashmap()
 	if len(q.grouping) < 1 {
-		streams.set(0, nil, *rows)
+		groups.Set([]parquet.Value{}, rows)
 	} else {
-		streams, err = b.group(rowGroup, rows, q)
+		groups, err = b.group(rowGroup, rows, q)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return b.aggregate(rowGroup, streams, q)
+	return b.aggregate(rowGroup, groups, q)
 }
 
-func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, q *query) (parquet.RowGroup, error) {
+// load reads the underlying bucket parquet files into a rowGroup and returns it.
+func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, sort bool, q *query) (parquet.RowGroup, error) {
 	b.catalogLock.RLock()
 	defer b.catalogLock.RUnlock()
 	table, ok := b.catalog.Tables[schema.Name()]
@@ -99,13 +104,18 @@ func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, q *query) (pa
 		}
 		rowGroups = append(rowGroups, file.RowGroups()...)
 	}
-	rowGroup, err := parquet.MergeRowGroups(rowGroups, schema)
+	options := []parquet.RowGroupOption{schema}
+	if sort {
+		options = append(options, parquet.SortingRowGroupConfig(parquet.SortingColumns(q.sorting...)))
+	}
+	rowGroup, err := parquet.MergeRowGroups(rowGroups, options...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge row groups: %v", err)
 	}
 	return rowGroup, nil
 }
 
+// filter performs the provided query on the rowGroup and returns a bitset of matching rows.
 func (b *Bucket) filter(rowGroup parquet.RowGroup, q *query) (*big.Int, error) {
 	filterColumns, err := createFilterColumns(rowGroup.Schema(), q)
 	if err != nil {
@@ -135,9 +145,9 @@ func (b *Bucket) filter(rowGroup parquet.RowGroup, q *query) (*big.Int, error) {
 	return rows, nil
 }
 
-func (b *Bucket) group(rowGroup parquet.RowGroup, rows *big.Int, q *query) (*hashmap[big.Int], error) {
-	hashes := make([][]uint64, rows.BitLen())
-	keys := make([][]parquet.Value, rows.BitLen())
+// group performs grouping operations defined in the query using the provided matching rows and returns a hashmap that maps groups to matching rows.
+func (b *Bucket) group(rowGroup parquet.RowGroup, rows *big.Int, q *query) (*group.Hashmap, error) {
+	rowKeys := make([][]parquet.Value, rows.BitLen())
 
 	for columnIdx, column := range rowGroup.Schema().Columns() {
 		columnName := column[0]
@@ -176,50 +186,47 @@ func (b *Bucket) group(rowGroup parquet.RowGroup, rows *big.Int, q *query) (*has
 				if rows.Bit(rowIdx) == 0 {
 					continue
 				}
-
-				hash, key := group(value)
-				hashes[rowIdx] = append(hashes[rowIdx], hash)
-				keys[rowIdx] = append(keys[rowIdx], key)
+				rowKeys[rowIdx] = append(rowKeys[rowIdx], group(value))
 			}
 		}
 	}
 
-	streams := newHashmap[big.Int]()
+	groups := group.NewHashmap()
 	count := 0
-	for row, hash := range hashes {
+	for row, keys := range rowKeys {
 		if rows.Bit(row) == 0 {
 			continue
 		}
-		count++
-		if count > b.maxGroupRows {
-			return nil, fmt.Errorf("maximum grouping size exceeded!")
-		}
 
-		streamHash, streamKey := maphash.Hash{}, keys[row]
-		streamHash.SetSeed(mapSeed)
-		for _, hash := range hash {
-			var buffer [8]byte
-			binary.LittleEndian.PutUint64(buffer[:], hash)
-			streamHash.Write(buffer[:])
+		group, ok := groups.Get(keys)
+		group.SetBit(group, row, 1)
+		if !ok {
+			count++
+			if count > b.maxGroupRows {
+				return nil, fmt.Errorf("maximum grouping size exceeded!")
+			}
+			groups.Set(keys, group)
 		}
-		rawStreamHash := streamHash.Sum64()
-		stream, _ := streams.get(rawStreamHash, streamKey)
-		stream.SetBit(&stream, row, 1)
-		streams.set(rawStreamHash, streamKey, stream)
 	}
-	return streams, nil
+	return groups, nil
 }
 
-func (b *Bucket) aggregate(rowGroup parquet.RowGroup, streams *hashmap[big.Int], q *query) ([]parquet.Row, error) {
+// aggregate performs defined aggregations on every provided group and returns the results as per-group-row.
+func (b *Bucket) aggregate(rowGroup parquet.RowGroup, groups *group.Hashmap, q *query) ([]parquet.Row, error) {
 	results := []parquet.Row{}
-	for hash, keys := range streams.keys() {
-		rows, _ := streams.get(hash, keys)
+	for keys, group := range groups.All() {
 		result := make(parquet.Row, len(rowGroup.Schema().Columns()))
 		for columnIdx, column := range rowGroup.Schema().Columns() {
 			columnName := column[0]
 			aggregate, ok := q.aggregators[columnName]
 			if !ok {
 				result[columnIdx] = parquet.NullValue()
+				for _, key := range keys {
+					if key.Column() == columnIdx {
+						result[columnIdx] = key
+						break
+					}
+				}
 				continue
 			}
 			chunk := rowGroup.ColumnChunks()[columnIdx]
@@ -250,7 +257,7 @@ func (b *Bucket) aggregate(rowGroup parquet.RowGroup, streams *hashmap[big.Int],
 					return nil, fmt.Errorf("failed to read rows: %v", err)
 				}
 				for valueIdx, value := range values[:n] {
-					if rows.Bit(int(firstPageRow)+valueIdx) == 0 {
+					if group.Bit(int(firstPageRow)+valueIdx) == 0 {
 						continue
 					}
 					rawValues = append(rawValues, value)
@@ -264,6 +271,7 @@ func (b *Bucket) aggregate(rowGroup parquet.RowGroup, streams *hashmap[big.Int],
 	return results, nil
 }
 
+// extract reads the provided row bitset, parses the rows and returns them.
 func (b *Bucket) extract(rowGroup parquet.RowGroup, rows *big.Int) ([]parquet.Row, error) {
 	reader := rowGroup.Rows()
 	defer reader.Close()
