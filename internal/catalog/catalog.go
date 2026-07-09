@@ -3,9 +3,12 @@
 // Abstracted into its own package to avoid top level bloat (rarely used by end users).
 package catalog
 
+import "time"
+
 type Catalog struct {
 	Key     string           `json:"-"`
 	ETag    *string          `json:"-"`
+	Expires time.Time        `json:"-"`
 	Version string           `json:"version"` // version is always v1 for now
 	Tables  map[string]Table `json:"tables"`
 }

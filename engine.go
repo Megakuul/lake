@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/megakuul/lakedb/internal/catalog"
@@ -78,8 +79,15 @@ func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) 
 
 // load reads the underlying bucket parquet files into a rowGroup and returns it.
 func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, sort bool, q *query) (parquet.RowGroup, error) {
+	if time.Now().After(b.catalog.Expires) {
+		if err := b.loadCatalog(ctx); err != nil {
+			return nil, err
+		}
+	}
+
 	b.catalogLock.RLock()
 	defer b.catalogLock.RUnlock()
+
 	table, ok := b.catalog.Tables[schema.Name()]
 	if !ok {
 		return nil, fmt.Errorf("table '%s' does not exist", schema.Name())
