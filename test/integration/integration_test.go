@@ -63,4 +63,8 @@ func TestOperations(t *testing.T) {
 	t.Run("test_sorting", func(t *testing.T) {
 		testSorting(t, bucket)
 	})
+
+	t.Run("test_compaction", func(t *testing.T) {
+		testCompaction(t, bucket)
+	})
 }

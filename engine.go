@@ -32,26 +32,41 @@ func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) 
 	if err != nil {
 		return nil, err
 	}
-	rows, err := b.filter(rowGroup, q)
+	filterColumns, err := createFilterColumns(rowGroup.Schema(), q)
 	if err != nil {
 		return nil, err
 	}
-
-	if applyLimit {
-		var (
-			limitedRows big.Int
-			count       int
-		)
-		for row := range rows.BitLen() {
-			if rows.Bit(row) == 1 {
-				count++
-				if count > q.limit {
-					break
-				}
-				limitedRows.SetBit(&limitedRows, row, 1)
-			}
+	var rows *big.Int
+	if len(filterColumns) > 0 {
+		rows, err = b.filter(rowGroup, filterColumns)
+		if err != nil {
+			return nil, err
 		}
-		rows = &limitedRows
+		if applyLimit {
+			var (
+				limitedRows big.Int
+				count       int
+			)
+			for row := range rows.BitLen() {
+				if rows.Bit(row) == 1 {
+					count++
+					if count > q.limit {
+						break
+					}
+					limitedRows.SetBit(&limitedRows, row, 1)
+				}
+			}
+			rows = &limitedRows
+		}
+	} else {
+		rowCount := int(rowGroup.NumRows())
+		if applyLimit && q.limit < int(rowCount) {
+			rowCount = q.limit
+		}
+		rows = new(big.Int)
+		for i := range rowCount {
+			rows.SetBit(rows, i, 1)
+		}
 	}
 
 	if !applyAggregation {
@@ -117,12 +132,10 @@ func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, sort bool, q 
 }
 
 // filter performs the provided query on the rowGroup and returns a bitset of matching rows.
-func (b *Bucket) filter(rowGroup parquet.RowGroup, q *query) (*big.Int, error) {
-	filterColumns, err := createFilterColumns(rowGroup.Schema(), q)
-	if err != nil {
-		return nil, err
+func (b *Bucket) filter(rowGroup parquet.RowGroup, filterColumns []filterColumn) (*big.Int, error) {
+	if len(filterColumns) < 1 {
+		return nil, fmt.Errorf("usage of empty filter is not allowed")
 	}
-
 	// rows is a bitset compressed '[]bool{}' that maps row positions to their "match" status.
 	var rows *big.Int
 	for i, filterColumn := range filterColumns {

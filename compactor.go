@@ -121,7 +121,7 @@ func (c *Compactor[T]) Compact(ctx context.Context) error {
 				Bucket:      &c.bucket.name,
 				Key:         &target,
 				IfNoneMatch: new("*"),
-				Body:        buffer,
+				Body:        bytes.NewReader(buffer.Bytes()),
 			})
 			if err != nil {
 				return err
