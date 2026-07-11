@@ -23,13 +23,27 @@ type Compactor[T any] struct {
 	bucket  *Bucket
 }
 
-func NewCompactor[T any](bucket *Bucket, minSize int) *Compactor[T] {
+type CompactorOption[T any] func(c *Compactor[T])
+
+func NewCompactor[T any](bucket *Bucket, opts ...CompactorOption[T]) *Compactor[T] {
 	tableName, tableSorting := getMetadata(reflect.TypeFor[T]())
-	return &Compactor[T]{
+	c := &Compactor[T]{
 		table:   tableName,
 		sorting: tableSorting,
-		minSize: minSize,
 		bucket:  bucket,
+		minSize: 32_000_000, // 32 MB
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// WithCompactionSize defines the minimum size in bytes that compacted shards must be.
+// Shards that are smaller than this are processed and compacted.
+func WithCompactionSize[T any](minimum int) CompactorOption[T] {
+	return func(c *Compactor[T]) {
+		c.minSize = minimum
 	}
 }
 
