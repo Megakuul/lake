@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	lake "github.com/megakuul/lakedb"
+	lake "github.com/megakuul/lake"
 )
 
 type Request struct {

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/megakuul/lakedb/internal/catalog"
+	"github.com/megakuul/lake/internal/catalog"
 	"github.com/parquet-go/parquet-go"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"

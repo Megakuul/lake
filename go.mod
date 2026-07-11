@@ -1,4 +1,4 @@
-module github.com/megakuul/lakedb
+module github.com/megakuul/lake
 
 go 1.26.1
 

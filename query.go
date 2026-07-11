@@ -6,7 +6,7 @@ import (
 	"maps"
 	"reflect"
 
-	"github.com/megakuul/lakedb/internal/catalog"
+	"github.com/megakuul/lake/internal/catalog"
 	"github.com/parquet-go/parquet-go"
 )
 

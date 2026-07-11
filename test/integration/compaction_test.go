@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	lake "github.com/megakuul/lakedb"
+	lake "github.com/megakuul/lake"
 )
 
 type GameStatistic struct {

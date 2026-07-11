@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/megakuul/lakedb/internal/catalog"
-	"github.com/megakuul/lakedb/internal/group"
+	"github.com/megakuul/lake/internal/catalog"
+	"github.com/megakuul/lake/internal/group"
 	"github.com/parquet-go/parquet-go"
 )
 

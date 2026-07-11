@@ -17,7 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
-	"github.com/megakuul/lakedb/internal/catalog"
+	"github.com/megakuul/lake/internal/catalog"
 )
 
 type Bucket struct {
