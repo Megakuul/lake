@@ -71,7 +71,7 @@ func (s String) filter(v parquet.Value) bool {
 		return true
 	}
 	for _, op := range s.filters {
-		if !op.check(string(v.ByteArray())) {
+		if op.check != nil && !op.check(string(v.ByteArray())) {
 			return false
 		}
 	}

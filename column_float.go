@@ -66,7 +66,7 @@ func (f Float) filter(v parquet.Value) bool {
 		return true
 	}
 	for _, op := range f.filters {
-		if !op.check(v.Double()) {
+		if op.check != nil && !op.check(v.Double()) {
 			return false
 		}
 	}

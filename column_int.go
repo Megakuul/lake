@@ -66,7 +66,7 @@ func (i Int) filter(v parquet.Value) bool {
 		return true
 	}
 	for _, op := range i.filters {
-		if !op.check(v.Int64()) {
+		if op.check != nil && !op.check(v.Int64()) {
 			return false
 		}
 	}
