@@ -17,7 +17,7 @@ jobs:
       - name: run staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
-          version: "2026.1"
+          version: "2026.2"
           checks: "all,-U1000"
       - name: run unit tests
         run: |
