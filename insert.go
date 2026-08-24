@@ -22,7 +22,7 @@ type Ingestor[T any] struct {
 	writer     *parquet.SortingWriter[T]
 	newWriter  func(*bytes.Buffer) *parquet.SortingWriter[T]
 	lastCommit time.Time
-	writerLock sync.RWMutex
+	writerLock sync.Mutex
 
 	maxDuration time.Duration
 }
@@ -59,16 +59,16 @@ func WithAutoCommit[T any](interval time.Duration) IngestorOption[T] {
 
 // Insert writes the provided parquet row to the processor. This does NOT write anything to disk.
 func (i *Ingestor[T]) Insert(ctx context.Context, rows ...T) error {
-	i.writerLock.RLock()
+	i.writerLock.Lock()
 	if _, err := i.writer.Write(rows); err != nil {
-		i.writerLock.RUnlock()
+		i.writerLock.Unlock()
 		return err
 	}
-	if i.maxDuration != -1 && time.Now().Add(i.maxDuration).After(i.lastCommit) {
-		i.writerLock.RUnlock()
+	if i.maxDuration != -1 && time.Now().Add(-i.maxDuration).After(i.lastCommit) {
+		i.writerLock.Unlock()
 		return i.Commit(ctx)
 	} else {
-		i.writerLock.RUnlock()
+		i.writerLock.Unlock()
 		return nil
 	}
 }

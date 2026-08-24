@@ -24,4 +24,4 @@ jobs:
           go test .
       - name: run integration tests
         run: |
-          go test ./test/integration
+          go test -race ./test/integration
