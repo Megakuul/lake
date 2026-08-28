@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -48,111 +49,108 @@ func WithCompactionSize[T any](minimum int) CompactorOption[T] {
 }
 
 func (c *Compactor[T]) Compact(ctx context.Context) error {
-	if time.Now().After(c.bucket.catalog.Expires) {
+	c.bucket.catalogLock.RLock()
+	expires := c.bucket.catalog.Expires
+	c.bucket.catalogLock.RUnlock()
+	if time.Now().After(expires) {
 		if err := c.bucket.loadCatalog(ctx); err != nil {
 			return err
 		}
 	}
 
-	compactableShards := map[int]catalog.Shard{}
-	compaction := func(ref *catalog.Catalog) error {
-		table := ref.Tables[c.table]
-		schema := parquet.NewSchema(c.table, parquet.SchemaOf(*new(T)))
+	c.bucket.catalogLock.RLock()
+	currentShards := slices.Clone(c.bucket.catalog.Tables[c.table].Shards)
+	c.bucket.catalogLock.RUnlock()
 
-		rowGroups := []parquet.RowGroup{}
-		for i, shard := range table.Shards {
-			if shard.Size > c.minSize {
-				continue
-			}
-			compactableShards[i] = shard
+	compactableShards := []catalog.Shard{}
+	schema := parquet.NewSchema(c.table, parquet.SchemaOf(*new(T)))
+
+	rowGroups := []parquet.RowGroup{}
+	for _, shard := range currentShards {
+		if shard.Size > c.minSize {
+			continue
 		}
-
-		for _, shard := range compactableShards {
-			result, err := c.bucket.client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket: &c.bucket.name,
-				Key:    &shard.Target,
-			})
-			if err != nil {
-				return err
-			}
-			defer result.Body.Close()
-			buffer, err := io.ReadAll(result.Body)
-			if err != nil {
-				return err
-			}
-			file, err := parquet.OpenFile(bytes.NewReader(buffer), int64(shard.Size))
-			if err != nil {
-				return fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
-			}
-			rowGroups = append(rowGroups, file.RowGroups()...)
-		}
-		rowGroup, err := parquet.MergeRowGroups(rowGroups, schema, parquet.SortingRowGroupConfig(parquet.SortingColumns(c.sorting...)))
-		if err != nil {
-			return fmt.Errorf("merge shards: %v", err)
-		}
-
-		reader := rowGroup.Rows()
-		defer reader.Close()
-
-		newShards := make([]catalog.Shard, 0, len(table.Shards))
-		for i, shard := range table.Shards {
-			if _, ok := compactableShards[i]; ok {
-				continue
-			}
-			newShards = append(newShards, shard)
-		}
-		proceed := true
-		for proceed {
-			buffer := bytes.NewBuffer(nil)
-			writer := parquet.NewGenericWriter[T](buffer, parquet.SortingWriterConfig(parquet.SortingColumns(c.sorting...)))
-			for proceed && writer.Size() < int64(c.minSize) {
-				rowBuffer := make([]parquet.Row, 1000)
-				n, err := reader.ReadRows(rowBuffer)
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						proceed = false
-					} else {
-						return fmt.Errorf("failed to read parquet row batch: %v", err)
-					}
-				}
-				_, err = writer.WriteRows(rowBuffer[:n])
-				if err != nil {
-					return fmt.Errorf("failed to write parquet row batch: %v", err)
-				}
-			}
-			if err := writer.Close(); err != nil {
-				return fmt.Errorf("failed to flush parquet writer: %v", err)
-			}
-			ranges, err := extractRanges(schema, writer.File().Metadata().RowGroups)
-			if err != nil {
-				return fmt.Errorf("extracting ranges: %v", err)
-			}
-
-			shardSize := buffer.Len()
-			target := path.Join(c.table, uuid.New().String()+".parquet")
-			_, err = c.bucket.client.PutObject(ctx, &s3.PutObjectInput{
-				Bucket:      &c.bucket.name,
-				Key:         &target,
-				IfNoneMatch: new("*"),
-				Body:        bytes.NewReader(buffer.Bytes()),
-			})
-			if err != nil {
-				return err
-			}
-			shard := catalog.Shard{
-				Size:   shardSize,
-				Target: target,
-				Ranges: ranges,
-			}
-			newShards = append(newShards, shard)
-		}
-
-		table.Shards = newShards
-		ref.Tables[c.table] = table
+		compactableShards = append(compactableShards, shard)
+	}
+	if len(compactableShards) < 2 {
 		return nil
 	}
 
-	err := c.bucket.commitCatalog(ctx, compaction)
+	for _, shard := range compactableShards {
+		result, err := c.bucket.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: &c.bucket.name,
+			Key:    &shard.Target,
+		})
+		if err != nil {
+			return err
+		}
+		defer result.Body.Close()
+		buffer, err := io.ReadAll(result.Body)
+		if err != nil {
+			return err
+		}
+		file, err := parquet.OpenFile(bytes.NewReader(buffer), int64(shard.Size))
+		if err != nil {
+			return fmt.Errorf("cannot open shard file '%s': %v", shard.Target, err)
+		}
+		rowGroups = append(rowGroups, file.RowGroups()...)
+	}
+	rowGroup, err := parquet.MergeRowGroups(rowGroups, schema, parquet.SortingRowGroupConfig(parquet.SortingColumns(c.sorting...)))
+	if err != nil {
+		return fmt.Errorf("merge shards: %v", err)
+	}
+
+	reader := rowGroup.Rows()
+	defer reader.Close()
+
+	newShards := []catalog.Shard{}
+	proceed := true
+	for proceed {
+		buffer := bytes.NewBuffer(nil)
+		writer := parquet.NewGenericWriter[T](buffer, parquet.SortingWriterConfig(parquet.SortingColumns(c.sorting...)))
+		for proceed && writer.Size() < int64(c.minSize) {
+			rowBuffer := make([]parquet.Row, 1000)
+			n, err := reader.ReadRows(rowBuffer)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					proceed = false
+				} else {
+					return fmt.Errorf("failed to read parquet row batch: %v", err)
+				}
+			}
+			_, err = writer.WriteRows(rowBuffer[:n])
+			if err != nil {
+				return fmt.Errorf("failed to write parquet row batch: %v", err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("failed to flush parquet writer: %v", err)
+		}
+		ranges, err := extractRanges(schema, writer.File().Metadata().RowGroups)
+		if err != nil {
+			return fmt.Errorf("extracting ranges: %v", err)
+		}
+
+		shardSize := buffer.Len()
+		target := path.Join(c.table, uuid.New().String()+".parquet")
+		_, err = c.bucket.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      &c.bucket.name,
+			Key:         &target,
+			IfNoneMatch: new("*"),
+			Body:        bytes.NewReader(buffer.Bytes()),
+		})
+		if err != nil {
+			return err
+		}
+		shard := catalog.Shard{
+			Size:   shardSize,
+			Target: target,
+			Ranges: ranges,
+		}
+		newShards = append(newShards, shard)
+	}
+
+	err = c.bucket.commitCatalog(ctx, c.table, newShards, compactableShards)
 	if err != nil {
 		return fmt.Errorf("compaction: %w", err)
 	}
@@ -164,7 +162,7 @@ func (c *Compactor[T]) Compact(ctx context.Context) error {
 			Key:    &shard.Target,
 		})
 		if err != nil {
-			shredErr = errors.Join(err, err)
+			shredErr = errors.Join(shredErr, err)
 		}
 	}
 	if shredErr != nil {

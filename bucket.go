@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"path"
 	"sync"
@@ -78,12 +79,8 @@ func WithRegion(region string) BucketOption {
 // NewFromClient initializes a dynamitedb bucket from an existing aws s3 sdk client.
 func NewFromClient(ctx context.Context, client *s3.Client, bucket string, opts ...BucketOption) (*Bucket, error) {
 	b := &Bucket{
-		name: bucket,
-		catalog: catalog.Catalog{
-			Key:    "lakedb.catalog",
-			ETag:   nil,
-			Tables: map[string]catalog.Table{},
-		},
+		name:                 bucket,
+		catalog:              newCatalog(),
 		catalogLock:          sync.RWMutex{},
 		client:               client,
 		catalogCacheDuration: time.Minute,
@@ -123,23 +120,25 @@ func (b *Bucket) write(ctx context.Context, tableName string, data []byte, range
 		Target: target,
 		Ranges: ranges,
 	}
-	modification := func(c *catalog.Catalog) error {
-		table := c.Tables[tableName]
-		table.Shards = append(table.Shards, shard)
-		c.Tables[tableName] = table
-		return nil
-	}
-	if err = b.commitCatalog(ctx, modification); err != nil {
+	if err = b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil); err != nil {
 		// retry once on optimistic lock failure
 		if errors.Is(err, ErrOptimisticLock) {
 			if err := b.loadCatalog(ctx); err != nil {
 				return err
 			}
-			return b.commitCatalog(ctx, modification)
+			return b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil)
 		}
 		return err
 	}
 	return nil
+}
+
+func newCatalog() catalog.Catalog {
+	return catalog.Catalog{
+		Key:    "lakedb.catalog",
+		ETag:   nil,
+		Tables: map[string]catalog.Table{},
+	}
 }
 
 // loadCatalog loads the current catalog from datastore into the engine.
@@ -177,6 +176,7 @@ func (b *Bucket) loadCatalog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b.catalog = newCatalog()
 	err = json.Unmarshal(rawCatalog, &b.catalog)
 	if err != nil {
 		return err
@@ -188,15 +188,29 @@ func (b *Bucket) loadCatalog(ctx context.Context) error {
 
 var ErrOptimisticLock = errors.New("optimistic lock failure")
 
-// commitCatalog applies modification and writes the current catalog to datastore.
+// commitCatalog adds the provided shards to the table and writes the current catalog to datastore.
 // It uses optimistic locking, if retry is set to true it will retry once on optimistic failure.
-func (b *Bucket) commitCatalog(ctx context.Context, modification func(*catalog.Catalog) error) error {
+func (b *Bucket) commitCatalog(ctx context.Context, table string, add, remove []catalog.Shard) error {
 	b.catalogLock.Lock()
 	defer b.catalogLock.Unlock()
-	if err := modification(&b.catalog); err != nil {
-		return err
+
+	newCatalog := b.catalog
+	newCatalog.Tables = maps.Clone(b.catalog.Tables)
+	newTable := newCatalog.Tables[table]
+	newTable.Shards = []catalog.Shard{}
+
+	removeMapper := map[string]bool{}
+	for _, shard := range remove {
+		removeMapper[shard.Target] = true
 	}
-	rawCatalog, err := json.Marshal(b.catalog)
+	for _, shard := range append(b.catalog.Tables[table].Shards, add...) {
+		if !removeMapper[shard.Target] {
+			newTable.Shards = append(newTable.Shards, shard)
+		}
+	}
+	newCatalog.Tables[table] = newTable
+
+	rawCatalog, err := json.Marshal(newCatalog)
 	if err != nil {
 		return err
 	}
@@ -213,6 +227,7 @@ func (b *Bucket) commitCatalog(ctx context.Context, modification func(*catalog.C
 		}
 		return err
 	}
+	b.catalog = newCatalog
 	b.catalog.ETag = result.ETag
 	return nil
 }

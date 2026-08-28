@@ -87,7 +87,10 @@ func (b *Bucket) process(ctx context.Context, schema *parquet.Schema, q *query) 
 
 // load reads the underlying bucket parquet files into a rowGroup and returns it.
 func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, sort bool, q *query) (parquet.RowGroup, error) {
-	if time.Now().After(b.catalog.Expires) {
+	b.catalogLock.RLock()
+	expires := b.catalog.Expires
+	b.catalogLock.RUnlock()
+	if time.Now().After(expires) {
 		if err := b.loadCatalog(ctx); err != nil {
 			return nil, err
 		}

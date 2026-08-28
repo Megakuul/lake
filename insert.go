@@ -16,15 +16,23 @@ import (
 
 // Ingestor provides a processor for one batch of input data.
 type Ingestor[T any] struct {
-	table      string
-	bucket     *Bucket
-	buffer     *bytes.Buffer
-	writer     *parquet.SortingWriter[T]
-	newWriter  func(*bytes.Buffer) *parquet.SortingWriter[T]
-	lastCommit time.Time
-	writerLock sync.Mutex
+	table          string
+	bucket         *Bucket
+	buffer         *bytes.Buffer
+	backlog        []ingestShard
+	maxBacklogSize int
+	writer         *parquet.SortingWriter[T]
+	newWriter      func(*bytes.Buffer) *parquet.SortingWriter[T]
+	lastCommit     time.Time
+	writerLock     sync.Mutex
 
 	maxDuration time.Duration
+}
+
+// ingestShard describes a compiled shard unit that waits to be written to storage.
+type ingestShard struct {
+	ranges map[string]catalog.Range
+	data   []byte
 }
 
 type IngestorOption[T any] func(i *Ingestor[T])
@@ -32,11 +40,13 @@ type IngestorOption[T any] func(i *Ingestor[T])
 func NewIngestor[T any](bucket *Bucket, opts ...IngestorOption[T]) *Ingestor[T] {
 	tableName, tableSorting := getMetadata(reflect.TypeFor[T]())
 	i := &Ingestor[T]{
-		table:       tableName,
-		buffer:      bytes.NewBuffer(nil),
-		bucket:      bucket,
-		lastCommit:  time.Now(),
-		maxDuration: -1,
+		table:          tableName,
+		buffer:         bytes.NewBuffer(nil),
+		backlog:        []ingestShard{},
+		maxBacklogSize: 100,
+		bucket:         bucket,
+		lastCommit:     time.Now(),
+		maxDuration:    -1,
 	}
 	i.newWriter = func(buffer *bytes.Buffer) *parquet.SortingWriter[T] {
 		return parquet.NewSortingWriter[T](buffer, 100_000, parquet.SortingWriterConfig(
@@ -50,6 +60,13 @@ func NewIngestor[T any](bucket *Bucket, opts ...IngestorOption[T]) *Ingestor[T] 
 	return i
 }
 
+// WithMaxBacklogSize defines a custom maximum queue size of failing writes that are kept in backlog.
+func WithMaxBacklogSize[T any](size int) IngestorOption[T] {
+	return func(i *Ingestor[T]) {
+		i.maxBacklogSize = size
+	}
+}
+
 // WithAutoCommit ensures that inserts automatically commit data after the specified interval.
 func WithAutoCommit[T any](interval time.Duration) IngestorOption[T] {
 	return func(i *Ingestor[T]) {
@@ -58,48 +75,68 @@ func WithAutoCommit[T any](interval time.Duration) IngestorOption[T] {
 }
 
 // Insert writes the provided parquet row to the processor. This does NOT write anything to disk.
-func (i *Ingestor[T]) Insert(ctx context.Context, rows ...T) error {
-	i.writerLock.Lock()
-	if _, err := i.writer.Write(rows); err != nil {
-		i.writerLock.Unlock()
+func (in *Ingestor[T]) Insert(ctx context.Context, rows ...T) error {
+	in.writerLock.Lock()
+	defer in.writerLock.Unlock()
+
+	if _, err := in.writer.Write(rows); err != nil {
 		return err
 	}
-	if i.maxDuration != -1 && time.Now().Add(-i.maxDuration).After(i.lastCommit) {
-		i.writerLock.Unlock()
-		return i.Commit(ctx)
+	if in.maxDuration != -1 && time.Now().Add(-in.maxDuration).After(in.lastCommit) {
+		return in.commit(ctx)
 	} else {
-		i.writerLock.Unlock()
 		return nil
 	}
 }
 
 // Commit writes the processed parquet rows to disk.
+func (in *Ingestor[T]) Commit(ctx context.Context) error {
+	in.writerLock.Lock()
+	defer in.writerLock.Unlock()
+	return in.commit(ctx)
+}
+
+// commit writes the processed parquet rows to disk (requires a writer lock to be already present).
 // This temporarily locks ingestion, writes to disk and replaces the underlying writer with a new one (parquet files are immutable).
 // After commit is done inserts proceed on the new writer.
-func (i *Ingestor[T]) Commit(ctx context.Context) error {
-	i.writerLock.Lock()
-	defer i.writerLock.Unlock()
+func (in *Ingestor[T]) commit(ctx context.Context) error {
+	if len(in.backlog) > in.maxBacklogSize {
+		in.backlog = in.backlog[1:]
+	}
+	defer func() {
+		in.buffer.Reset()
+		in.writer = in.newWriter(in.buffer)
+		in.lastCommit = time.Now()
+	}()
 
-	if err := i.writer.Close(); err != nil {
+	if err := in.writer.Close(); err != nil {
 		return fmt.Errorf("failed to flush parquet writer: %v", err)
 	}
-	schema := parquet.NewSchema(i.table, parquet.SchemaOf(*new(T)))
-	ranges, err := extractRanges(schema, i.writer.File().Metadata().RowGroups)
+	schema := parquet.NewSchema(in.table, parquet.SchemaOf(*new(T)))
+	ranges, err := extractRanges(schema, in.writer.File().Metadata().RowGroups)
 	if err != nil {
 		return fmt.Errorf("extracting ranges: %v", err)
 	}
-	if err = i.bucket.write(ctx, i.table, i.buffer.Bytes(), ranges); err != nil {
-		return fmt.Errorf("bucket writer: %v", err)
+	if in.writer.File().NumRows() > 0 {
+		in.backlog = append(in.backlog, ingestShard{
+			ranges: ranges,
+			data:   bytes.Clone(in.buffer.Bytes()),
+		})
 	}
-	i.buffer.Reset()
-	i.writer = i.newWriter(i.buffer)
-	i.lastCommit = time.Now()
+
+	for i, shard := range in.backlog {
+		if err = in.bucket.write(ctx, in.table, shard.data, shard.ranges); err != nil {
+			in.backlog = in.backlog[i:]
+			return fmt.Errorf("bucket writer: %v", err)
+		}
+	}
+	in.backlog = nil
 	return nil
 }
 
 // Close writes the ingested rows into the underlying storage.
-func (i *Ingestor[T]) Close(ctx context.Context) error {
-	return i.Commit(ctx)
+func (in *Ingestor[T]) Close(ctx context.Context) error {
+	return in.Commit(ctx)
 }
 
 // extractRanges reads the metadata from the provided row groups to calculate the catalog ranges per row.
@@ -143,7 +180,7 @@ func extractRanges(schema *parquet.Schema, rowGroups thrift.Slice[format.RowGrou
 					columnRange.MaxEnabled = true
 					columnRange.MaxString = string(max.ByteArray())
 				}
-				if !update || columnRange.MinString > string(max.ByteArray()) {
+				if !update || columnRange.MinString > string(min.ByteArray()) {
 					columnRange.MinEnabled = true
 					columnRange.MinString = string(min.ByteArray())
 				}

@@ -75,8 +75,8 @@ func Gt[T ~float64 | ~int64 | ~string](operand T) Filter[T] {
 // Lte checks if the operand is less or equals than the row value.
 func Lte[T ~float64 | ~int64 | ~string](operand T) Filter[T] {
 	return Filter[T]{
-		max: nil,
-		min: &operand,
+		max: &operand,
+		min: nil,
 		check: func(left T) bool {
 			return left <= operand
 		},
@@ -86,8 +86,8 @@ func Lte[T ~float64 | ~int64 | ~string](operand T) Filter[T] {
 // Lt checks if the operand is less than the row value.
 func Lt[T ~float64 | ~int64 | ~string](operand T) Filter[T] {
 	return Filter[T]{
-		max: nil,
-		min: &operand,
+		max: &operand,
+		min: nil,
 		check: func(left T) bool {
 			return left < operand
 		},

@@ -44,10 +44,10 @@ func createFilterColumns(schema *parquet.Schema, q *query) ([]filterColumn, erro
 		}
 
 		if chunkFilter.MinEnabled {
-			weight += 10
+			weight -= 10
 		}
 		if chunkFilter.MaxEnabled {
-			weight += 10
+			weight -= 10
 		}
 
 		filterColumns = append(filterColumns, filterColumn{
