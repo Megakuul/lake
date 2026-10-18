@@ -96,15 +96,16 @@ func (b *Bucket) load(ctx context.Context, schema *parquet.Schema, sort bool, q 
 		}
 	}
 
+	// the lock is released before downloading to not block commits during slow queries.
 	b.catalogLock.RLock()
-	defer b.catalogLock.RUnlock()
-
 	table, ok := b.catalog.Tables[schema.Name()]
+	shards := filterShards(table.Shards, q.ranges)
+	b.catalogLock.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("table '%s' does not exist", schema.Name())
 	}
 	rowGroups := []parquet.RowGroup{}
-	for _, shard := range filterShards(table.Shards, q.ranges) {
+	for _, shard := range shards {
 		result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: &b.name,
 			Key:    &shard.Target,
@@ -141,22 +142,16 @@ func (b *Bucket) filter(rowGroup parquet.RowGroup, filterColumns []filterColumn)
 	}
 	// rows is a bitset compressed '[]bool{}' that maps row positions to their "match" status.
 	var rows *big.Int
-	for i, filterColumn := range filterColumns {
+	for _, filterColumn := range filterColumns {
 		chunk := rowGroup.ColumnChunks()[filterColumn.index]
 		var matches big.Int
 		if err := scanChunk(chunk, &matches, rows, filterColumn.chunkRange, filterColumn.chunkCheck); err != nil {
 			return nil, fmt.Errorf("failed scan chunk: %v", err)
 		}
-		// first column captures all matches
-		if i == 0 {
-			rows = &matches
-			continue
-		}
-		// other columns just remove bits from rows
-		for row := range rows.BitLen() {
-			if rows.Bit(row) == 1 && matches.Bit(row) == 0 {
-				rows.SetBit(rows, row, 0)
-			}
+		// matches only contains rows that were already set in rows (skip bitset), so it replaces it
+		rows = &matches
+		if rows.Sign() == 0 {
+			break // nothing left to match
 		}
 	}
 	return rows, nil
@@ -203,7 +198,8 @@ func (b *Bucket) group(rowGroup parquet.RowGroup, rows *big.Int, q *query) (*gro
 				if rows.Bit(rowIdx) == 0 {
 					continue
 				}
-				rowKeys[rowIdx] = append(rowKeys[rowIdx], group(value))
+				// groupers derive new values, which must keep the column index for the result mapping.
+				rowKeys[rowIdx] = append(rowKeys[rowIdx], group(value).Level(value.RepetitionLevel(), value.DefinitionLevel(), value.Column()))
 			}
 		}
 	}
@@ -230,6 +226,19 @@ func (b *Bucket) group(rowGroup parquet.RowGroup, rows *big.Int, q *query) (*gro
 
 // aggregate performs defined aggregations on every provided group and returns the results as per-group-row.
 func (b *Bucket) aggregate(rowGroup parquet.RowGroup, groups *group.Hashmap, q *query) ([]parquet.Row, error) {
+	// every aggregated column is read once and shared across all groups.
+	columns := map[int][]parquet.Value{}
+	for columnIdx, column := range rowGroup.Schema().Columns() {
+		if _, ok := q.aggregators[column[0]]; !ok {
+			continue
+		}
+		values, err := readColumn(rowGroup.ColumnChunks()[columnIdx])
+		if err != nil {
+			return nil, err
+		}
+		columns[columnIdx] = values
+	}
+
 	results := []parquet.Row{}
 	for keys, group := range groups.All() {
 		result := make(parquet.Row, len(rowGroup.Schema().Columns()))
@@ -246,37 +255,9 @@ func (b *Bucket) aggregate(rowGroup parquet.RowGroup, groups *group.Hashmap, q *
 				}
 				continue
 			}
-			chunk := rowGroup.ColumnChunks()[columnIdx]
-
-			pages := chunk.Pages()
-			defer pages.Close()
-
-			offsetIndex, err := chunk.OffsetIndex()
-			if err != nil {
-				return nil, fmt.Errorf("failed to read offset index: %v", err)
-			}
-
 			rawValues := []parquet.Value{}
-			for pageIdx := range offsetIndex.NumPages() {
-				firstPageRow := offsetIndex.FirstRowIndex(pageIdx)
-
-				err := pages.SeekToRow(firstPageRow)
-				if err != nil {
-					return nil, fmt.Errorf("failed to seek to page row: %v", err)
-				}
-				page, err := pages.ReadPage()
-				if err != nil {
-					return nil, fmt.Errorf("failed to read page: %v", err)
-				}
-				values := make([]parquet.Value, page.NumValues())
-				n, err := page.Values().ReadValues(values)
-				if err != nil && err != io.EOF {
-					return nil, fmt.Errorf("failed to read rows: %v", err)
-				}
-				for valueIdx, value := range values[:n] {
-					if group.Bit(int(firstPageRow)+valueIdx) == 0 {
-						continue
-					}
+			for row, value := range columns[columnIdx] {
+				if group.Bit(row) == 1 {
 					rawValues = append(rawValues, value)
 				}
 			}
@@ -286,6 +267,29 @@ func (b *Bucket) aggregate(rowGroup parquet.RowGroup, groups *group.Hashmap, q *
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+// readColumn reads all values of the column chunk (indexed by row).
+func readColumn(chunk parquet.ColumnChunk) ([]parquet.Value, error) {
+	pages := chunk.Pages()
+	defer pages.Close()
+
+	result := make([]parquet.Value, 0, chunk.NumValues())
+	for {
+		page, err := pages.ReadPage()
+		if err != nil {
+			if err == io.EOF {
+				return result, nil
+			}
+			return nil, fmt.Errorf("failed to read page: %v", err)
+		}
+		values := make([]parquet.Value, page.NumValues())
+		n, err := page.Values().ReadValues(values)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read rows: %v", err)
+		}
+		result = append(result, values[:n]...)
+	}
 }
 
 // extract reads the provided row bitset, parses the rows and returns them.

@@ -120,24 +120,24 @@ func (b *Bucket) write(ctx context.Context, tableName string, data []byte, range
 		Target: target,
 		Ranges: ranges,
 	}
-	if err = b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil); err != nil {
-		// retry once on optimistic lock failure
-		if errors.Is(err, ErrOptimisticLock) {
-			if err := b.loadCatalog(ctx); err != nil {
-				return err
-			}
-			return b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil)
+	// retry on optimistic lock failure
+	for range 5 {
+		if err = b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil); !errors.Is(err, ErrOptimisticLock) {
+			return err
 		}
-		return err
+		if err = b.loadCatalog(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return err
 }
 
 func newCatalog() catalog.Catalog {
 	return catalog.Catalog{
-		Key:    "lakedb.catalog",
-		ETag:   nil,
-		Tables: map[string]catalog.Table{},
+		Key:     "lakedb.catalog",
+		Version: "v1",
+		ETag:    nil,
+		Tables:  map[string]catalog.Table{},
 	}
 }
 
@@ -176,11 +176,11 @@ func (b *Bucket) loadCatalog(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	b.catalog = newCatalog()
-	err = json.Unmarshal(rawCatalog, &b.catalog)
-	if err != nil {
-		return err
+	loaded := newCatalog()
+	if err = json.Unmarshal(rawCatalog, &loaded); err != nil {
+		return err // keep the previous catalog (and its ETag) intact
 	}
+	b.catalog = loaded
 	b.catalog.ETag = result.ETag
 	b.catalog.Expires = time.Now().Add(b.catalogCacheDuration)
 	return nil

@@ -9,7 +9,6 @@ import (
 	"path"
 	"reflect"
 	"slices"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
@@ -49,13 +48,9 @@ func WithCompactionSize[T any](minimum int) CompactorOption[T] {
 }
 
 func (c *Compactor[T]) Compact(ctx context.Context) error {
-	c.bucket.catalogLock.RLock()
-	expires := c.bucket.catalog.Expires
-	c.bucket.catalogLock.RUnlock()
-	if time.Now().After(expires) {
-		if err := c.bucket.loadCatalog(ctx); err != nil {
-			return err
-		}
+	// always work on the latest catalog, otherwise the commit most likely fails on the optimistic lock.
+	if err := c.bucket.loadCatalog(ctx); err != nil {
+		return err
 	}
 
 	c.bucket.catalogLock.RLock()
@@ -126,6 +121,9 @@ func (c *Compactor[T]) Compact(ctx context.Context) error {
 		if err := writer.Close(); err != nil {
 			return fmt.Errorf("failed to flush parquet writer: %v", err)
 		}
+		if writer.File().NumRows() == 0 {
+			break // reader was exhausted exactly at the previous shard boundary
+		}
 		ranges, err := extractRanges(schema, writer.File().Metadata().RowGroups)
 		if err != nil {
 			return fmt.Errorf("extracting ranges: %v", err)
@@ -152,6 +150,10 @@ func (c *Compactor[T]) Compact(ctx context.Context) error {
 
 	err = c.bucket.commitCatalog(ctx, c.table, newShards, compactableShards)
 	if err != nil {
+		// the new shards are not referenced by the catalog; remove them to not leave orphans.
+		for _, shard := range newShards {
+			c.bucket.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &c.bucket.name, Key: &shard.Target})
+		}
 		return fmt.Errorf("compaction: %w", err)
 	}
 

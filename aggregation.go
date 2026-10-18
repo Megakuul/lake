@@ -47,6 +47,9 @@ func Max[T int64 | float64](rows iter.Seq[T], count int) (result T) {
 
 // Avg returns the average column value.
 func Avg[T int64 | float64](rows iter.Seq[T], count int) (result T) {
+	if count == 0 {
+		return result
+	}
 	var total T
 	for row := range rows {
 		total += row

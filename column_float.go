@@ -39,11 +39,11 @@ func (f Float) createRange() catalog.Range {
 	var max, min float64
 	var maxEnabled, minEnabled bool
 	for _, filter := range f.filters {
-		if filter.max != nil && (!maxEnabled || max < *filter.max) {
+		if filter.max != nil && (!maxEnabled || *filter.max < max) {
 			maxEnabled = true
 			max = *filter.max
 		}
-		if filter.min != nil && (!minEnabled || min > *filter.min) {
+		if filter.min != nil && (!minEnabled || *filter.min > min) {
 			minEnabled = true
 			min = *filter.min
 		}

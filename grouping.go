@@ -18,13 +18,25 @@ func Exact() Grouper {
 	}
 }
 
+// floorDiv divides with integer arithmetic (avoids float64 precision loss on large values) and rounds towards negative infinity.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b < 0 {
+		q--
+	}
+	return q
+}
+
 // Round is only for numerical values (lake.Int / lake.Float).
 // It rounds the value to the bucket size to retrieve the group value.
 func Round(bucketSize int64) Grouper {
 	return func(v parquet.Value) parquet.Value {
+		if bucketSize <= 0 {
+			return v
+		}
 		switch v.Kind() {
 		case parquet.Int64:
-			return parquet.Int64Value(int64(math.Round(float64(v.Int64())/float64(bucketSize)) * float64(bucketSize)))
+			return parquet.Int64Value(floorDiv(v.Int64()+bucketSize/2, bucketSize) * bucketSize)
 		case parquet.Double:
 			return parquet.DoubleValue(math.Round(v.Double()/float64(bucketSize)) * float64(bucketSize))
 		}
@@ -36,9 +48,12 @@ func Round(bucketSize int64) Grouper {
 // It floors the value to the bucket size to retrieve the group value.
 func Floor(bucketSize int64) Grouper {
 	return func(v parquet.Value) parquet.Value {
+		if bucketSize <= 0 {
+			return v
+		}
 		switch v.Kind() {
 		case parquet.Int64:
-			return parquet.Int64Value(int64(math.Floor(float64(v.Int64())/float64(bucketSize))) * bucketSize)
+			return parquet.Int64Value(floorDiv(v.Int64(), bucketSize) * bucketSize)
 		case parquet.Double:
 			return parquet.DoubleValue(math.Floor(v.Double()/float64(bucketSize)) * float64(bucketSize))
 		}
@@ -65,10 +80,7 @@ func Prefix(length int) Grouper {
 			return v
 		}
 		data := v.ByteArray()
-		if len(data) < length {
-			length = len(data)
-		}
-		return parquet.ByteArrayValue(data[:length])
+		return parquet.ByteArrayValue(data[:min(length, len(data))])
 	}
 }
 
@@ -99,7 +111,7 @@ const (
 	DateYear
 )
 
-// Date is only for lake.Int values that represent a time.Time in Unix (seconds).
+// Date is only for lake.Int values that represent a time.Time in Unix (nanoseconds).
 // It removes everything from the date after the range to group values to "day", "hour", etc. buckets.
 func Date(r DateRange) Grouper {
 	return func(v parquet.Value) (result parquet.Value) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 	"time"
@@ -166,13 +167,16 @@ func extractRanges(schema *parquet.Schema, rowGroups thrift.Slice[format.RowGrou
 				}
 			case parquet.Double:
 				columnRange.Kind = catalog.ColumnFloat
-				if !update || columnRange.MaxFloat < max.Double() {
+				// json cannot encode +-Inf / NaN; clamp so the catalog stays serializable.
+				maxFloat := math.Max(-math.MaxFloat64, math.Min(math.MaxFloat64, max.Double()))
+				minFloat := math.Max(-math.MaxFloat64, math.Min(math.MaxFloat64, min.Double()))
+				if !update || columnRange.MaxFloat < maxFloat {
 					columnRange.MaxEnabled = true
-					columnRange.MaxFloat = max.Double()
+					columnRange.MaxFloat = maxFloat
 				}
-				if !update || columnRange.MinFloat > min.Double() {
+				if !update || columnRange.MinFloat > minFloat {
 					columnRange.MinEnabled = true
-					columnRange.MinFloat = min.Double()
+					columnRange.MinFloat = minFloat
 				}
 			case parquet.ByteArray:
 				columnRange.Kind = catalog.ColumnString
