@@ -133,7 +133,7 @@ func (b *Bucket) write(ctx context.Context, tableName string, data []byte, range
 		}
 		return b.loadCatalog(ctx)
 	}
-	return err
+	return ErrOptimisticLock
 }
 
 func newCatalog() catalog.Catalog {
