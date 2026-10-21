@@ -122,12 +122,16 @@ func (b *Bucket) write(ctx context.Context, tableName string, data []byte, range
 	}
 	// retry on optimistic lock failure
 	for range 5 {
-		if err = b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil); !errors.Is(err, ErrOptimisticLock) {
-			return err
+		if err = b.commitCatalog(ctx, tableName, []catalog.Shard{shard}, nil); err != nil {
+			if !errors.Is(err, ErrOptimisticLock) {
+				return err
+			}
+			if err = b.loadCatalog(ctx); err != nil {
+				return err
+			}
+			continue
 		}
-		if err = b.loadCatalog(ctx); err != nil {
-			return err
-		}
+		return b.loadCatalog(ctx)
 	}
 	return err
 }
